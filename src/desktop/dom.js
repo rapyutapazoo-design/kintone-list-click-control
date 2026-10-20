@@ -4,6 +4,7 @@
  */
 import { isTargetView, resolveLookupMode, loadConfig } from '../core/config.js';
 import { parseRecordUrl, buildRecordUrl, getGuestSpaceIdFromPath, getGuestSpaceIdFromApiUrl } from '../core/url.js';
+import { detectLookupCell } from '../core/lookup.js';
 import { createAclChecker, createKintoneFetcher, createKintoneRecordFetcher } from '../core/acl.js';
 import { decideRowClick, decideLinkClick, resolveOpenMode, INTERACTIVE_SELECTOR } from '../core/rowClick.js';
 
@@ -269,18 +270,21 @@ export function createListController(deps) {
     /** @type {Array<{anchor: HTMLAnchorElement, req: any, kind: string}>} */
     const entries = [];
     const permOn = !!(aclChecker && config.permission.enabled);
+    const currentAppId = deps.getAppId();
     for (const [code, els] of cellsByCode) {
-      const prop = props[code];
-      if (!prop) continue;
-      const isLookup = !!prop.lookup;
-      const isLink = prop.type === 'LINK' && prop.protocol === 'WEB';
-      if (!isLookup && !isLink) continue;
+      const prop = props[code] || null;
+      const isLink = !!prop && prop.type === 'LINK' && prop.protocol === 'WEB';
       els.forEach((cell, i) => {
         const anchor = cell.querySelector('a');
         const rowRecordId = records[i]?.$id?.value;
         if (!anchor || rowRecordId === undefined) return;
         const href = currentHref(anchor);
-        const parsed = href ? parseRecordUrl(href, host) : null;
+        const det = isLink
+          ? { isLookup: false, parsed: href ? parseRecordUrl(href, host) : null }
+          : detectLookupCell({ prop, recordType: records[i]?.[code]?.type, href, host, currentAppId });
+        const parsed = det.parsed;
+        const isLookup = det.isLookup;
+        if (!isLookup && !isLink) return;
         if (isLookup) {
           const mode = resolveLookupMode(config, code);
           const info = { kind: 'lookup', fieldCode: code, rowRecordId: String(rowRecordId), mode, checked: false, req: null };
@@ -292,7 +296,7 @@ export function createListController(deps) {
             info.checked = true; // リンク先なし: API は呼ばずクリック時に notfound 扱い
             return;
           }
-          const lk = prop.lookup;
+          const lk = prop?.lookup;
           const appId = lk?.relatedApp?.app ?? parsed?.appId;
           if (!appId) return;
           // href を解析できたときはその spaceId（null＝通常スペース）を正とする
@@ -302,7 +306,7 @@ export function createListController(deps) {
             req = { spaceId, appId: String(appId), keyType: 'id', keyField: null, value: parsed.recordId };
           } else if (lk?.relatedKeyField) {
             let value = (cell.textContent || '').trim();
-            if (prop.type === 'NUMBER') value = value.replace(/,/g, '');
+            if ((prop?.type ?? records[i]?.[code]?.type) === 'NUMBER') value = value.replace(/,/g, '');
             req = { spaceId, appId: String(appId), keyType: 'key', keyField: lk.relatedKeyField, value };
           } else {
             return;
