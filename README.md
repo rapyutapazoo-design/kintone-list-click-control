@@ -55,7 +55,7 @@ npm install
 npm test            # vitest（core の単体テストと jsdom 結合テスト）
 npm run build       # plugin/js/{desktop,mobile,config}.js と plugin/image/icon.png を生成
 npm run dev         # watch ビルド
-npm run package     # build のあと dist/plugin.zip を生成
+npm run package     # build のあと dist/plugin-<version>.zip（と互換コピー dist/plugin.zip）を生成
 ```
 
 - ソースは素の JavaScript（ESM）＋ JSDoc です。esbuild で IIFE（es2019）にバンドルします。
@@ -66,9 +66,24 @@ npm run package     # build のあと dist/plugin.zip を生成
 
 `npm run package` で `private.ppk` がなければ新規に生成します。**同じ ppk でパッケージしないとプラグイン ID が変わり、更新インストールできません。** 安全な場所にバックアップしてください。`*.ppk`・`dist/`・`plugin/js/` は `.gitignore` 済みで、git には含めません。
 
+## バージョン更新手順
+
+正のバージョンは `package.json` の `version` です。`plugin/manifest.json` の `version` は `npm run package` 時に package.json の値で上書きされます（リポジトリ上の値も同じにしてあります）。版は `X.Y.Z` 形式のみ（先頭ゼロ・プレリリース接尾辞は不可）です。
+
+1. `npm version minor --no-git-tag-version`（patch / major も可）で package.json の版を上げる。git のコミット・タグは作りません。
+2. `npm run package` を実行する（manifest の版は自動同期されます）。
+3. kintone システム管理 > プラグインで `dist/plugin-<version>.zip` を「読み込む」。同じ ppk なのでプラグイン ID は変わらず、更新扱いになります（版を上げても ppk が同じなら ID は不変です）。
+
+- 前回パッケージした版は `dist/.last-packaged-version` に記録されます。同じ版、または低い版で再度 `npm run package` すると exit 1 で止まります。
+- 意図的に作り直す場合は `npm run package -- --force`（`--` の後ろの引数が package.mjs に渡ります）。`--force` は検証用で、同一版を再作成しても kintone は更新として扱わない可能性が高いです。
+- 変更が反映されないときの確認:
+  1. ブラウザを強制再読込（Cmd+Shift+R）する。
+  2. DevTools > Sources でページが読んでいる `desktop.js` を開き、`klc-acl-v2` や `GAIA_RE01` など最新の文字列が含まれるか検索する。
+  3. kintone のプラグイン一覧に表示されるバージョンが上がっているか確認する。
+
 ## kintone へのインストール
 
-1. kintone システム管理 > プラグイン > 「読み込む」から `dist/plugin.zip` を取り込む。
+1. kintone システム管理 > プラグイン > 「読み込む」から `dist/plugin-<version>.zip`（互換コピーの `dist/plugin.zip` も同内容）を取り込む。
 2. 対象アプリのプラグイン設定で追加し、設定画面で各項目を設定して保存、アプリを更新する。
 
 ## 既知の制約
