@@ -142,7 +142,7 @@ function withTimeout(promise, ms) {
 /**
  * @param {{
  *  fetcher: Fetcher, recordFetcher?: RecordFetcher|null, host: string, now?: () => number,
- *  storage?: {getItem: Function, setItem: Function}|null,
+ *  storage?: {getItem: Function, setItem: Function, removeItem?: Function}|null,
  *  ttlSec?: number, concurrency?: number, timeoutMs?: number, storageKey?: string
  * }} opts
  */
@@ -283,7 +283,8 @@ export function createAclChecker({
             budget.left--;
             queue.push(() => runRecheck(g, v, settleOne));
           } else {
-            settleOne(v, 'error', false, false);
+            // 上限超過分は従来どおり deny とするが、再確認していないのでキャッシュしない（次回 check で再判定）
+            settleOne(v, 'deny', false, false);
           }
         } else {
           settleOne(v, 'deny', true, false);

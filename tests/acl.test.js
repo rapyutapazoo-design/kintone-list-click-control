@@ -341,48 +341,67 @@ describe('二段階確認', () => {
     expect(rf).toHaveBeenCalledTimes(0);
   });
 
-  it('再確認の上限（超過分は error、次の check で再確認できる）', async () => {
+  it('再確認の上限（超過分は deny だがキャッシュせず、次の check で再確認できる）', async () => {
     expect(MAX_RECHECK_PER_CHECK).toBe(10);
     const rf = recFetcher({});
-    const c = createAclChecker({ fetcher: echoFetcher([]), recordFetcher: rf, host: HOST });
+    const f = echoFetcher([]);
+    const c = createAclChecker({ fetcher: f, recordFetcher: rf, host: HOST });
     const ids = Array.from({ length: 12 }, (_, i) => String(i + 1));
     const r = await c.check(ids.map((v) => idReq(v)));
     expect(rf).toHaveBeenCalledTimes(10);
     const states = ids.map((v) => r.get(key(v)));
     expect(states.filter((x) => x === 'allow')).toHaveLength(10);
-    expect(states.filter((x) => x === 'error')).toHaveLength(2);
-    expect(c.peek(idReq('11'))).toBeNull(); // error はキャッシュされない
+    expect(states.filter((x) => x === 'deny')).toHaveLength(2);
+    expect(states.filter((x) => x === 'error')).toHaveLength(0);
+    expect(c.peek(idReq('11'))).toBeNull(); // 上限超過の deny はキャッシュされない
+    expect(c.peek(idReq('12'))).toBeNull();
+    const bulkCalls = f.mock.calls.length;
     const r2 = await c.check([idReq('11'), idReq('12')]);
+    expect(f.mock.calls.length).toBe(bulkCalls + 1); // バックオフされず再度問い合わせ対象になる
     expect(rf).toHaveBeenCalledTimes(12);
     expect(r2.get(key('11'))).toBe('allow');
     expect(r2.get(key('12'))).toBe('allow');
   });
 
-  it('再確認の並列度は concurrency に従う', async () => {
+  it('上限超過の deny は sessionStorage にも保存されない', async () => {
+    const st = fakeStorage();
+    const rf = recFetcher({});
+    const c = createAclChecker({ fetcher: echoFetcher([]), recordFetcher: rf, host: HOST, storage: st });
+    const ids = Array.from({ length: 12 }, (_, i) => String(i + 1));
+    await c.check(ids.map((v) => idReq(v)));
+    const saved = JSON.parse(st.getItem('klc-acl-v2'));
+    expect(saved.entries).toHaveLength(10);
+    expect(saved.entries.some(([k]) => k === key('11') || k === key('12'))).toBe(false);
+  });
+
+  it('再確認の並列度は concurrency に従い、上限まで並列化される', async () => {
     let cur = 0;
     let max = 0;
-    const resolvers = [];
+    const pending = [];
     const rf = vi.fn(() => {
       cur++;
       max = Math.max(max, cur);
-      return new Promise((res) => resolvers.push(() => { cur--; res({ record: {} }); }));
+      return new Promise((res) => pending.push(() => { cur--; res({ record: {} }); }));
     });
     const c = createAclChecker({ fetcher: echoFetcher([]), recordFetcher: rf, host: HOST, concurrency: 2 });
     const p = c.check(['1', '2', '3', '4', '5'].map((v) => idReq(v)));
-    for (let i = 0; i < 40 && resolvers.length < 5; i++) {
-      await Promise.resolve();
-      while (resolvers.length > 0 && rf.mock.calls.length > 0 && cur > 0) {
-        resolvers.shift()();
-        await Promise.resolve();
-      }
-    }
-    for (let i = 0; i < 20; i++) {
-      await new Promise((r) => setTimeout(r, 0));
-      while (resolvers.length) resolvers.shift()();
-    }
-    const r = await p;
+    const tick = () => new Promise((r) => setTimeout(r, 0));
+    await tick();
+    expect(rf).toHaveBeenCalledTimes(2); // すべて保留中: 同時に 2 件まで
+    pending.shift()();
+    await tick();
+    expect(rf).toHaveBeenCalledTimes(3); // 1 件解決で次が 1 件始まる
+    pending.shift()();
+    await tick();
+    expect(rf).toHaveBeenCalledTimes(4);
+    for (let i = 0; i < 50 && pending.length < 2; i++) await tick();
+    expect(pending).toHaveLength(2);
+    pending.shift()();
+    await tick();
     expect(rf).toHaveBeenCalledTimes(5);
-    expect(max).toBeLessThanOrEqual(2);
+    while (pending.length) pending.shift()();
+    const r = await p;
+    expect(max).toBe(2);
     expect(r.get(key('5'))).toBe('allow');
   });
 
