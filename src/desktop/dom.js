@@ -2,8 +2,9 @@
  * 一覧画面コントローラ（desktop / mobile 共用）。
  * グローバルの kintone / KUC は参照せず、依存はすべて注入で受け取る。
  */
-import { isTargetView, resolveLookupMode } from '../core/config.js';
-import { parseRecordUrl, buildRecordUrl } from '../core/url.js';
+import { isTargetView, resolveLookupMode, loadConfig } from '../core/config.js';
+import { parseRecordUrl, buildRecordUrl, getGuestSpaceIdFromPath, getGuestSpaceIdFromApiUrl } from '../core/url.js';
+import { createAclChecker, createKintoneFetcher } from '../core/acl.js';
 import { decideRowClick, resolveOpenMode, INTERACTIVE_SELECTOR } from '../core/rowClick.js';
 
 const MSG_PENDING = '遷移先の権限を確認しています…';
@@ -189,7 +190,8 @@ export function createListController(deps) {
           const lk = prop.lookup;
           const appId = lk?.relatedApp?.app ?? parsed?.appId;
           if (!appId) return;
-          const spaceId = parsed?.spaceId ?? currentSpaceId;
+          // href を解析できたときはその spaceId（null＝通常スペース）を正とする
+          const spaceId = parsed ? parsed.spaceId : currentSpaceId;
           let req;
           if (parsed?.recordId) {
             req = { spaceId, appId: String(appId), keyType: 'id', keyField: null, value: parsed.recordId };
@@ -207,7 +209,7 @@ export function createListController(deps) {
           if (!parsed || !parsed.recordId) return;
           entries.push({
             anchor,
-            req: { spaceId: parsed.spaceId ?? currentSpaceId, appId: parsed.appId, keyType: 'id', keyField: null, value: parsed.recordId },
+            req: { spaceId: parsed.spaceId, appId: parsed.appId, keyType: 'id', keyField: null, value: parsed.recordId },
             kind: 'recordLink',
           });
         }
@@ -216,17 +218,23 @@ export function createListController(deps) {
     return entries;
   }
 
-  function applyState(anchor, state) {
+  function applyState(anchor, state, onStandardError) {
     if (state === 'allow') return applyAllow(anchor);
     if (state === 'deny') return applyDisabled(anchor, 'deny');
     // error
     if (config.permission.onError === 'disable') return applyDisabled(anchor, 'error');
-    warn('権限を確認できなかったため標準動作にします');
+    if (onStandardError) onStandardError();
     applyAllow(anchor);
   }
 
   function runAcl(gen, entries) {
     if (!aclChecker || entries.length === 0) return;
+    let warned = false;
+    const warnOnce = () => {
+      if (warned) return;
+      warned = true;
+      warn('権限を確認できなかったため標準動作にします');
+    };
     const unresolved = [];
     for (const e of entries) {
       const s = aclChecker.peek(e.req);
@@ -248,13 +256,13 @@ export function createListController(deps) {
         if (gen !== generation) return;
         for (const e of unresolved) {
           if (!e.anchor.isConnected) continue;
-          applyState(e.anchor, map.get(aclChecker.cacheKey(e.req)) || 'error');
+          applyState(e.anchor, map.get(aclChecker.cacheKey(e.req)) || 'error', warnOnce);
         }
       },
       () => {
         if (gen !== generation) return;
         for (const e of unresolved) {
-          if (e.anchor.isConnected) applyState(e.anchor, 'error');
+          if (e.anchor.isConnected) applyState(e.anchor, 'error', warnOnce);
         }
       },
     );
@@ -321,7 +329,7 @@ export function createListController(deps) {
         const appId = deps.getAppId();
         const url =
           findOwnRecordUrl(a.closest('tr'), appId, info.rowRecordId, host) ||
-          buildRecordUrl({ appId, recordId: info.rowRecordId, spaceId: currentSpaceId });
+          buildRecordUrl({ appId, recordId: info.rowRecordId, spaceId: currentSpaceId, platform });
         deps.navigate(url, openModeOf(e));
         return;
       }
@@ -341,7 +349,7 @@ export function createListController(deps) {
       button: e.button,
       hasSelectionInRow: !!(sel && String(sel.toString()) !== '' && sel.anchorNode && tr.contains(sel.anchorNode)),
       insideInteractive: !!(interactive && tr.contains(interactive)),
-      isDataCell: !!(td && row.dataCells.has(td)),
+      isDataCell: !!(td && [...row.dataCells].some((c) => c === td || c.contains(target) || td.contains(c))),
       rowHasFormControl: !!tr.querySelector('input, select, textarea'),
       recordId: row.recordId,
     });
@@ -349,7 +357,7 @@ export function createListController(deps) {
     const appId = deps.getAppId();
     const url =
       findOwnRecordUrl(tr, appId, row.recordId, host) ||
-      buildRecordUrl({ appId, recordId: row.recordId, spaceId: currentSpaceId });
+      buildRecordUrl({ appId, recordId: row.recordId, spaceId: currentSpaceId, platform });
     deps.navigate(url, openModeOf(e));
   }
 
@@ -362,3 +370,86 @@ export function createListController(deps) {
 
   return { onIndexShow, dispose };
 }
+
+/**
+ * 共有のエントリ初期化（desktop / mobile 共通）。kintone オブジェクトは引数で受け取る。
+ * @param {{platform: 'desktop'|'mobile', eventName: string, kintone: any, getAppId: () => any, getFieldElements: (code: string) => any}} p
+ */
+export function setupEntry({ platform, eventName, kintone, getAppId, getFieldElements }) {
+  const PLUGIN_ID = kintone.$PLUGIN_ID;
+  const config = loadConfig(kintone.plugin.app.getConfig(PLUGIN_ID));
+
+  const noLookupControl =
+    config.lookup.mode === 'standard' && Object.values(config.lookup.fields).every((m) => m === 'standard' || m === 'inherit');
+  const rowOff = platform !== 'desktop' || config.rowClick === 'default';
+  if (rowOff && noLookupControl && !config.permission.enabled) return;
+
+  // ページのパスから判定し、取れなければ kintone.api.url の結果（ゲスト用パス）から判定する（モバイルのパス形式に依存しない）
+  let currentSpaceId = getGuestSpaceIdFromPath(location.pathname);
+  if (currentSpaceId === null) {
+    try {
+      currentSpaceId = getGuestSpaceIdFromApiUrl(kintone.api.url('/k/v1/app', true));
+    } catch {
+      /* 判定不能時は通常スペース扱い */
+    }
+  }
+
+  let fieldsPromise = null;
+  const fetchFormFields = () => {
+    if (!fieldsPromise) {
+      fieldsPromise = kintone
+        // ゲストスペースの判定は kintone に任せる（desktop / mobile 共通）
+        .api(kintone.api.url('/k/v1/app/form/fields.json', true), 'GET', { app: getAppId() })
+        .then((r) => r.properties || {})
+        .catch((e) => {
+          console.warn('[klc] フォーム情報の取得に失敗しました', e);
+          return {};
+        });
+    }
+    return fieldsPromise;
+  };
+
+  const aclChecker = config.permission.enabled
+    ? createAclChecker({
+        fetcher: createKintoneFetcher(kintone),
+        host: location.host,
+        ttlSec: config.permission.cacheTtlSec,
+        storage: safeSessionStorage(),
+      })
+    : null;
+
+  const controller = createListController({
+    platform,
+    config,
+    getAppId: () => String(getAppId()),
+    getFieldElements,
+    fetchFormFields,
+    aclChecker,
+    host: location.host,
+    currentSpaceId,
+    navigate: (url, mode) => {
+      if (mode === 'new') window.open(url, '_blank', 'noopener');
+      else location.href = url;
+    },
+    root: window,
+    getSelection: () => window.getSelection(),
+  });
+
+  kintone.events.on(eventName, (event) => {
+    try {
+      controller.onIndexShow(event);
+    } catch (e) {
+      console.warn('[klc]', e);
+    }
+    return event;
+  });
+}
+
+function safeSessionStorage() {
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+

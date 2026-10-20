@@ -185,6 +185,14 @@ import { getGuestSpaceIdFromPath } from '../core/url.js';
       notify('キャッシュ時間は 0 以上の整数で入力してください。');
       return;
     }
+    if (Number(ttlText) > 3600) {
+      notify('キャッシュ時間は 0〜3600 の範囲で入力してください。');
+      return;
+    }
+    if (viewsMode.value === 'selected' && (viewIds.value || []).length === 0) {
+      notify('「選択した一覧のみ」を選ぶときは、対象の一覧を 1 つ以上選んでください。');
+      return;
+    }
     const lookupFieldValues = {};
     for (const [code, dd] of Object.entries(fieldDropdowns)) lookupFieldValues[code] = dd.value;
     const formCfg = buildConfigFromForm({

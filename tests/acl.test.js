@@ -45,6 +45,15 @@ describe('helpers', () => {
     expect(extractValues([{ $id: { value: '1' } }, { $id: { value: ' 2 ' } }], { keyType: 'id', keyField: null })).toEqual(new Set(['1', '2']));
     expect(extractValues([{ code: { value: 'a' }, $id: { value: '1' } }], { keyType: 'key', keyField: 'code' })).toEqual(new Set(['a']));
   });
+  it('URL 不整合系エラー（GAIA_IL23, CB_IJ01）は error、Unicode のキーフィールドは許可', () => {
+    expect(classifyError({ code: 'GAIA_IL23' })).toBe('error');
+    expect(classifyError({ code: 'GAIA_NO01' })).toBe('error');
+    expect(classifyError({ code: 'CB_IJ01' })).toBe('error');
+    expect(buildInQuery({ keyType: 'key', keyField: '々コード_１', values: ['a'] })).toContain('々コード_１ in');
+    expect(() => buildInQuery({ keyType: 'key', keyField: 'a"b', values: ['x'] })).toThrow();
+    expect(() => buildInQuery({ keyType: 'key', keyField: 'a b', values: ['x'] })).toThrow();
+    expect(() => buildInQuery({ keyType: 'key', keyField: 'a=b', values: ['x'] })).toThrow();
+  });
   it('classifyError / nextBackoffMs', () => {
     expect(classifyError({ code: 'CB_NO02' })).toBe('appDeny');
     expect(classifyError({ code: 'GAIA_AP01' })).toBe('appDeny');

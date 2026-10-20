@@ -227,6 +227,42 @@ describe('ルックアップ', () => {
 describe('権限判定', () => {
   const permCfg = { permission: { enabled: true, targets: { lookup: true, recordLink: true } } };
 
+  it('ゲストスペース内でも href が通常アプリなら spaceId は null（href を優先）', async () => {
+    const acl = fakeAcl();
+    const list = buildList([{ id: 10, cust: 5 }, { id: 11, cust: 6 }], {
+      custHref: (r) => (r.id === 10 ? '/k/2/show#record=5' : '/k/guest/7/2/show#record=6'),
+      linkHref: () => '/k/3/show#record=1',
+    });
+    const { controller } = mk({ list, deps: { aclChecker: acl, currentSpaceId: '5' } }, permCfg);
+    controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
+    await flush();
+    const reqs = acl.check.mock.calls[0][0];
+    expect(reqs.find((r) => r.value === '5' && r.appId === '2').spaceId).toBeNull();
+    expect(reqs.find((r) => r.value === '6').spaceId).toBe('7');
+    expect(reqs.find((r) => r.appId === '3').spaceId).toBeNull();
+  });
+
+  it('href が解析できないキー型は currentSpaceId を使う', async () => {
+    const acl = fakeAcl();
+    const list = buildList([{ id: 10, cust: 5 }], { custHref: () => null });
+    const { controller } = mk({ list, deps: { aclChecker: acl, currentSpaceId: '5' } }, permCfg);
+    controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
+    await flush();
+    const r = acl.check.mock.calls[0][0].find((x) => x.keyType === 'key');
+    expect(r.spaceId).toBe('5');
+  });
+
+  it('標準動作へ戻るエラーの警告は 1 回の判定につき 1 回', async () => {
+    const acl = fakeAcl();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { controller, list } = mk({ deps: { aclChecker: acl } }, permCfg);
+    controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
+    await flush();
+    acl.resolveLast(() => 'error');
+    await flush();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
   it('pending -> deny -> 退避、allow -> 復元', async () => {
     const acl = fakeAcl();
     const { controller, list } = mk({ deps: { aclChecker: acl } }, permCfg);
@@ -351,5 +387,58 @@ describe('権限判定', () => {
     expect(acl.check.mock.calls[0][0]).toEqual([
       { spaceId: null, appId: '2', keyType: 'key', keyField: 'code', value: '顧客5' },
     ]);
+  });
+});
+
+describe('モバイル', () => {
+  const mobile = (over = {}, cfg = {}) =>
+    mk({ ...over, deps: { platform: 'mobile', ...(over.deps || {}) } }, cfg);
+
+  it('self は /k/m/{app}/show?record= 形式へ遷移（ゲスト含む）', async () => {
+    const list = buildList([{ id: 10, cust: 5 }], { detailLink: false });
+    const a = mobile({ list }, { lookup: { mode: 'self' } });
+    a.controller.onIndexShow({ records: list.records });
+    await flush();
+    click(list.cells.cust[0].querySelector('a'));
+    expect(a.navigate).toHaveBeenCalledWith('/k/m/1/show?record=10', 'same');
+
+    const list2 = buildList([{ id: 10, cust: 5 }], { detailLink: false });
+    const b = mobile({ list: list2, deps: { currentSpaceId: '5' } }, { lookup: { mode: 'self' } });
+    b.controller.onIndexShow({ records: list2.records });
+    await flush();
+    click(list2.cells.cust[0].querySelector('a'));
+    expect(b.navigate).toHaveBeenCalledWith('/k/guest/5/m/1/show?record=10', 'same');
+  });
+
+  it('モバイル形式の href から ID 型で権限判定する', async () => {
+    const acl = fakeAcl();
+    const permCfg = { permission: { enabled: true, targets: { lookup: true, recordLink: true } } };
+    const list = buildList([{ id: 10, cust: 5 }], {
+      custHref: (r) => `/k/guest/7/m/2/show?record=${r.cust}`,
+    });
+    const { controller } = mobile({ list, deps: { aclChecker: acl } }, permCfg);
+    controller.onIndexShow({ records: list.records });
+    await flush();
+    const r = acl.check.mock.calls[0][0].find((x) => x.appId === '2');
+    expect(r).toMatchObject({ keyType: 'id', value: '5', spaceId: '7' });
+  });
+
+  it('モバイルでは行クリックで遷移しない', async () => {
+    const { controller, list, navigate } = mobile();
+    controller.onIndexShow({ records: list.records });
+    click(list.cells.text[0]);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it('td 内の要素が getFieldElements から返っても行クリックが効く', () => {
+    const list = buildList([{ id: 10, cust: 5 }]);
+    const inner = document.createElement('span');
+    list.cells.text[0].appendChild(inner);
+    list.cells.text[0] = inner;
+    const { controller, navigate } = mk({ list });
+    controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
+    click(inner);
+    click(inner.parentElement);
+    expect(navigate).toHaveBeenCalledTimes(2);
   });
 });

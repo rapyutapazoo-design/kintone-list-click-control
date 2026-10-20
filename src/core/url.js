@@ -2,7 +2,9 @@
  * kintone レコード URL のユーティリティ（純粋関数）。
  */
 
-const SHOW_PATH = /^\/k\/(?:guest\/(\d+)\/)?(\d+)\/show\/?$/;
+// desktop: /k/{app}/show, /k/guest/{space}/{app}/show
+// mobile : /k/m/{app}/show, /k/guest/{space}/m/{app}/show
+const SHOW_PATH = /^\/k\/(?:guest\/(\d+)\/)?(m\/)?(\d+)\/show\/?$/;
 
 /**
  * @param {string} href
@@ -20,24 +22,28 @@ export function parseRecordUrl(href, baseHost) {
   if (u.host !== baseHost) return null;
   const m = SHOW_PATH.exec(u.pathname);
   if (!m) return null;
-  const rec = /(?:^#|&)record=(\d+)(?:&|$)/.exec(u.hash);
-  return { host: u.host, spaceId: m[1] || null, appId: m[2], recordId: rec ? rec[1] : null };
+  // desktop は hash（#record=）、mobile は query（?record=）。どちらの形式でも解析する
+  const recRe = /(?:^[#?]|&)record=(\d+)(?:&|$)/;
+  const rec = recRe.exec(u.hash) || recRe.exec(u.search);
+  return { host: u.host, spaceId: m[1] || null, appId: m[3], recordId: rec ? rec[1] : null };
 }
 
 /**
- * @param {{appId: string|number, recordId: string|number, spaceId?: string|number|null}} p
+ * @param {{appId: string|number, recordId: string|number, spaceId?: string|number|null, platform?: 'desktop'|'mobile'}} p
  * @returns {string}
  */
-export function buildRecordUrl({ appId, recordId, spaceId }) {
+export function buildRecordUrl({ appId, recordId, spaceId, platform = 'desktop' }) {
   const digits = /^\d+$/;
   if (!digits.test(String(appId)) || !digits.test(String(recordId))) {
     throw new Error('invalid appId or recordId');
   }
+  const mobile = platform === 'mobile';
+  const tail = mobile ? `m/${appId}/show?record=${recordId}` : `${appId}/show#record=${recordId}`;
   if (spaceId !== null && spaceId !== undefined && spaceId !== '') {
     if (!digits.test(String(spaceId))) throw new Error('invalid spaceId');
-    return `/k/guest/${spaceId}/${appId}/show#record=${recordId}`;
+    return `/k/guest/${spaceId}/${tail}`;
   }
-  return `/k/${appId}/show#record=${recordId}`;
+  return `/k/${tail}`;
 }
 
 /**
@@ -45,7 +51,24 @@ export function buildRecordUrl({ appId, recordId, spaceId }) {
  * @returns {string|null}
  */
 export function getGuestSpaceIdFromPath(pathname) {
-  const m = /^\/k\/guest\/(\d+)\//.exec(pathname || '');
+  const m = /^\/k\/(?:m\/)?guest\/(\d+)\//.exec(pathname || '');
+  return m ? m[1] : null;
+}
+
+/**
+ * kintone.api.url(path, true) の結果（パスまたは URL）からゲストスペース ID を取得する。
+ * 例: '/k/guest/7/v1/app.json' -> '7'、'/k/v1/app.json' -> null
+ * @param {string} apiUrl
+ * @returns {string|null}
+ */
+export function getGuestSpaceIdFromApiUrl(apiUrl) {
+  let pathname;
+  try {
+    pathname = new URL(String(apiUrl || ''), 'https://example.invalid').pathname;
+  } catch {
+    return null;
+  }
+  const m = /^\/k\/guest\/(\d+)\//.exec(pathname);
   return m ? m[1] : null;
 }
 

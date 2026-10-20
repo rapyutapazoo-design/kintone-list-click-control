@@ -3,7 +3,7 @@ import {
   defaultConfig, migrate, normalize, loadConfig, serializeConfig, sanitizeForSave,
   resolveLookupMode, isTargetView, buildConfigFromForm,
 } from '../src/core/config.js';
-import { parseRecordUrl, buildRecordUrl, getGuestSpaceIdFromPath, buildApiPath } from '../src/core/url.js';
+import { parseRecordUrl, buildRecordUrl, getGuestSpaceIdFromPath, buildApiPath, getGuestSpaceIdFromApiUrl } from '../src/core/url.js';
 import { decideRowClick, resolveOpenMode, INTERACTIVE_SELECTOR } from '../src/core/rowClick.js';
 
 describe('config', () => {
@@ -143,6 +143,22 @@ describe('url', () => {
     expect(() => buildRecordUrl({ appId: 'a', recordId: '2' })).toThrow();
     expect(() => buildRecordUrl({ appId: '1', recordId: '2/x' })).toThrow();
     expect(() => buildRecordUrl({ appId: '1', recordId: '2', spaceId: 'x' })).toThrow();
+  });
+  it('モバイル URL（?record= 形式、ゲスト含む）と desktop 形式の併用', () => {
+    expect(parseRecordUrl('/k/m/12/show?record=34', host)).toEqual({ host, spaceId: null, appId: '12', recordId: '34' });
+    expect(parseRecordUrl('/k/guest/5/m/12/show?record=34&x=1', host)).toEqual({ host, spaceId: '5', appId: '12', recordId: '34' });
+    expect(parseRecordUrl('/k/m/12/show#record=34', host)?.recordId).toBe('34');
+    expect(parseRecordUrl('/k/m/12/edit?record=34', host)).toBeNull();
+    expect(buildRecordUrl({ appId: 1, recordId: 2, platform: 'mobile' })).toBe('/k/m/1/show?record=2');
+    expect(buildRecordUrl({ appId: 1, recordId: 2, spaceId: '9', platform: 'mobile' })).toBe('/k/guest/9/m/1/show?record=2');
+    expect(getGuestSpaceIdFromPath('/k/guest/7/m/3/')).toBe('7');
+  });
+  it('getGuestSpaceIdFromApiUrl', () => {
+    expect(getGuestSpaceIdFromApiUrl('/k/guest/7/v1/app.json')).toBe('7');
+    expect(getGuestSpaceIdFromApiUrl('https://a.cybozu.com/k/guest/12/v1/app')).toBe('12');
+    expect(getGuestSpaceIdFromApiUrl('/k/v1/app')).toBeNull();
+    expect(getGuestSpaceIdFromApiUrl('')).toBeNull();
+    expect(getGuestSpaceIdFromPath('/k/m/guest/7/3/')).toBe('7');
   });
   it('getGuestSpaceIdFromPath / buildApiPath', () => {
     expect(getGuestSpaceIdFromPath('/k/guest/7/3/')).toBe('7');

@@ -1,4 +1,4 @@
-import { setupEntry } from './setup.js';
+import { setupEntry } from './dom.js';
 
 setupEntry({
   platform: 'desktop',

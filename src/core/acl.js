@@ -8,10 +8,14 @@
  */
 import { buildApiPath } from './url.js';
 
-/** アプリ全体に権限がない・存在しない場合のエラーコード。【要検証】実機で確認すること。 */
-export const APP_DENY_CODES = ['CB_NO02', 'GAIA_AP01', 'GAIA_IL23', 'CB_IJ01', 'GAIA_NO01'];
+/**
+ * アプリ全体に権限がない・存在しない場合のエラーコード。【要検証】実機で確認すること。
+ * URL・パラメータ不整合系（GAIA_IL23, CB_IJ01 など）は含めない（error として非キャッシュで標準動作に戻す）。
+ */
+export const APP_DENY_CODES = ['CB_NO02', 'GAIA_AP01'];
 
-const KEY_FIELD_PATTERN = /^[A-Za-z0-9_$぀-ヿ一-鿿＀-ﾟ・＿]+$/;
+// kintone のフィールドコード許容文字（記号を除く任意の文字・数字・_・・・＿）。空白・引用符・演算子記号は不可。
+const KEY_FIELD_PATTERN = /^[\p{L}\p{M}\p{N}_$・＿]+$/u;
 const MAX_STORAGE_ENTRIES = 2000;
 
 /** @param {AclRequest} req */

@@ -51,12 +51,3 @@
   gap: 12px;
   margin-top: 24px;
 }
-.klc-config .klc-lookup-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-.klc-config .klc-lookup-table td {
-  padding: 6px 8px;
-  border-bottom: 1px solid #eef0f1;
-  vertical-align: middle;
-}
