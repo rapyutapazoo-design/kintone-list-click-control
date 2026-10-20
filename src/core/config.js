@@ -8,17 +8,18 @@
  * @property {{mode: 'standard'|'text'|'self', fields: Record<string, 'inherit'|'standard'|'text'|'self'>}} lookup
  * @property {{mode: 'all'|'selected', ids: string[]}} views
  * @property {boolean} hover
- * @property {{enabled: boolean, targets: {lookup: boolean, recordLink: boolean}, onError: 'standard'|'disable', cacheTtlSec: number}} permission
+ * @property {{enabled: boolean, targets: {lookup: boolean, recordLink: boolean}, onDeny: 'self'|'disable', onError: 'standard'|'self'|'disable', cacheTtlSec: number}} permission
  */
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 const ROW_CLICK = ['default', 'row'];
 const OPEN_MODE = ['same', 'new'];
 const LOOKUP_MODE = ['standard', 'text', 'self'];
 const LOOKUP_FIELD_MODE = ['inherit', 'standard', 'text', 'self'];
 const VIEWS_MODE = ['all', 'selected'];
-const ON_ERROR = ['standard', 'disable'];
+const ON_ERROR = ['standard', 'self', 'disable'];
+const ON_DENY = ['self', 'disable'];
 const DEFAULT_TTL = 300;
 
 /** @returns {Config} */
@@ -33,11 +34,14 @@ export function defaultConfig() {
     permission: {
       enabled: false,
       targets: { lookup: true, recordLink: false },
-      onError: 'standard',
+      onDeny: 'self',
+      onError: 'self',
       cacheTtlSec: DEFAULT_TTL,
     },
   };
 }
+
+const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 /**
  * @param {object} raw
@@ -48,13 +52,19 @@ export function migrate(raw) {
   const v = Number(obj.schemaVersion);
   if (!Number.isFinite(v) || v < 1) {
     obj.schemaVersion = 1;
+  } else {
+    obj.schemaVersion = v;
   }
-  // 将来の版用の分岐雛形:
-  // if (obj.schemaVersion === 1) { ...; obj.schemaVersion = 2; }
+  if (obj.schemaVersion === 1) {
+    // v1 -> v2: permission.onDeny を補う。onError は保存値のまま残す
+    if (isObj(obj.permission) && !('onDeny' in obj.permission)) {
+      obj.permission = { ...obj.permission, onDeny: 'self' };
+    }
+    obj.schemaVersion = 2;
+  }
   return obj;
 }
 
-const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const pickEnum = (v, list, def) => (list.includes(v) ? v : def);
 const pickBool = (v, def) => (v === true || v === false ? v : def);
 
@@ -99,6 +109,7 @@ export function normalize(raw) {
         lookup: pickBool(targets.lookup, d.permission.targets.lookup),
         recordLink: pickBool(targets.recordLink, d.permission.targets.recordLink),
       },
+      onDeny: pickEnum(perm.onDeny, ON_DENY, d.permission.onDeny),
       onError: pickEnum(perm.onError, ON_ERROR, d.permission.onError),
       cacheTtlSec: ttl,
     },
@@ -177,7 +188,7 @@ export function isTargetView(cfg, event) {
  *  rowClick?: string, openMode?: string, lookupMode?: string,
  *  lookupFields?: Record<string,string>, viewsMode?: string, viewIds?: string[],
  *  hover?: boolean, permEnabled?: boolean, permLookup?: boolean, permRecordLink?: boolean,
- *  onError?: string, cacheTtlSec?: string|number
+ *  onDeny?: string, onError?: string, cacheTtlSec?: string|number
  * }} v
  * @returns {Config}
  */
@@ -191,6 +202,7 @@ export function buildConfigFromForm(v) {
     permission: {
       enabled: v.permEnabled,
       targets: { lookup: v.permLookup, recordLink: v.permRecordLink },
+      onDeny: v.onDeny,
       onError: v.onError,
       cacheTtlSec: v.cacheTtlSec,
     },

@@ -4,14 +4,14 @@ import {
   resolveLookupMode, isTargetView, buildConfigFromForm,
 } from '../src/core/config.js';
 import { parseRecordUrl, buildRecordUrl, getGuestSpaceIdFromPath, buildApiPath, getGuestSpaceIdFromApiUrl } from '../src/core/url.js';
-import { decideRowClick, resolveOpenMode, INTERACTIVE_SELECTOR } from '../src/core/rowClick.js';
+import { decideRowClick, decideLinkClick, resolveOpenMode, INTERACTIVE_SELECTOR } from '../src/core/rowClick.js';
 
 describe('config', () => {
   it('defaultConfig が design の既定値と一致する', () => {
     expect(defaultConfig()).toEqual({
-      schemaVersion: 1, rowClick: 'default', openMode: 'same',
+      schemaVersion: 2, rowClick: 'default', openMode: 'same',
       lookup: { mode: 'standard', fields: {} }, views: { mode: 'all', ids: [] }, hover: true,
-      permission: { enabled: false, targets: { lookup: true, recordLink: false }, onError: 'standard', cacheTtlSec: 300 },
+      permission: { enabled: false, targets: { lookup: true, recordLink: false }, onDeny: 'self', onError: 'self', cacheTtlSec: 300 },
     });
   });
 
@@ -44,7 +44,7 @@ describe('config', () => {
       rowClick: 'x', openMode: 1, hover: 'yes',
       lookup: { mode: 'zzz', fields: { a: 'text', b: 'bad', c: 'inherit' } },
       views: { mode: 'q', ids: [1, '1', 2, null] },
-      permission: { enabled: 'true', onError: 'boom', targets: { lookup: 0 } },
+      permission: { enabled: 'true', onDeny: 'zzz', onError: 'boom', targets: { lookup: 0 } },
     });
     expect(n.rowClick).toBe('default');
     expect(n.openMode).toBe('same');
@@ -54,7 +54,8 @@ describe('config', () => {
     expect(n.views.mode).toBe('all');
     expect(n.views.ids).toEqual(['1', '2']);
     expect(n.permission.enabled).toBe(false);
-    expect(n.permission.onError).toBe('standard');
+    expect(n.permission.onError).toBe('self');
+    expect(n.permission.onDeny).toBe('self');
     expect(n.permission.targets.lookup).toBe(true);
   });
 
@@ -67,9 +68,9 @@ describe('config', () => {
   });
 
   it('schemaVersion なしの migrate', () => {
-    expect(migrate({ rowClick: 'row' }).schemaVersion).toBe(1);
-    expect(migrate({ schemaVersion: 0 }).schemaVersion).toBe(1);
-    expect(migrate(null).schemaVersion).toBe(1);
+    expect(migrate({ rowClick: 'row' }).schemaVersion).toBe(2);
+    expect(migrate({ schemaVersion: 0 }).schemaVersion).toBe(2);
+    expect(migrate(null).schemaVersion).toBe(2);
     expect(loadConfig({ config: JSON.stringify({ rowClick: 'row' }) }).rowClick).toBe('row');
   });
 
@@ -104,13 +105,73 @@ describe('config', () => {
     const c = buildConfigFromForm({
       rowClick: 'row', openMode: 'new', lookupMode: 'text', lookupFields: { a: 'self' },
       viewsMode: 'selected', viewIds: ['3'], hover: false, permEnabled: true, permLookup: true,
-      permRecordLink: true, onError: 'disable', cacheTtlSec: '60',
+      permRecordLink: true, onDeny: 'disable', onError: 'disable', cacheTtlSec: '60',
     });
     expect(c.rowClick).toBe('row');
     expect(c.lookup.fields).toEqual({ a: 'self' });
     expect(c.views.ids).toEqual(['3']);
     expect(c.hover).toBe(false);
-    expect(c.permission).toEqual({ enabled: true, targets: { lookup: true, recordLink: true }, onError: 'disable', cacheTtlSec: 60 });
+    expect(c.permission).toEqual({ enabled: true, targets: { lookup: true, recordLink: true }, onDeny: 'disable', onError: 'disable', cacheTtlSec: 60 });
+  });
+
+  it('migrate v1→v2: onDeny=self を補い onError は保存値のまま。入力は書き換えない', () => {
+    const input = { schemaVersion: 1, permission: { enabled: true, onError: 'standard' } };
+    const m = migrate(input);
+    expect(m.schemaVersion).toBe(2);
+    expect(m.permission.onDeny).toBe('self');
+    expect(m.permission.onError).toBe('standard');
+    expect(input).toEqual({ schemaVersion: 1, permission: { enabled: true, onError: 'standard' } });
+  });
+
+  it('migrate v1 で onDeny が既にあれば残す', () => {
+    const m = migrate({ schemaVersion: 1, permission: { onDeny: 'disable' } });
+    expect(m.permission.onDeny).toBe('disable');
+    expect(m.schemaVersion).toBe(2);
+  });
+
+  it('migrate v2 はそのまま、文字列 "1" も v1 として移行する', () => {
+    const v2 = { schemaVersion: 2, permission: { onDeny: 'disable', onError: 'self' } };
+    expect(migrate(v2)).toEqual(v2);
+    const m = migrate({ schemaVersion: '1', permission: { enabled: true } });
+    expect(m.schemaVersion).toBe(2);
+    expect(m.permission.onDeny).toBe('self');
+  });
+
+  it('loadConfig: v1 の JSON を読むと onDeny=self、onError は保存値のまま', () => {
+    const v1 = { schemaVersion: 1, rowClick: 'row', permission: { enabled: true, targets: { lookup: true, recordLink: false }, onError: 'disable', cacheTtlSec: 60 } };
+    const c = loadConfig({ config: JSON.stringify(v1) });
+    expect(c.schemaVersion).toBe(2);
+    expect(c.permission.onDeny).toBe('self');
+    expect(c.permission.onError).toBe('disable');
+    expect(c.permission.cacheTtlSec).toBe(60);
+  });
+
+  it('normalize: onError self/disable、onDeny disable が通る', () => {
+    expect(normalize({ permission: { onError: 'self' } }).permission.onError).toBe('self');
+    expect(normalize({ permission: { onError: 'disable' } }).permission.onError).toBe('disable');
+    expect(normalize({ permission: { onDeny: 'disable' } }).permission.onDeny).toBe('disable');
+  });
+});
+
+describe('decideLinkClick', () => {
+  const rows = [];
+  for (const onDeny of ['self', 'disable']) {
+    for (const onError of ['standard', 'self', 'disable']) {
+      const denyAct = onDeny === 'disable' ? 'block' : 'self';
+      const errAct = { standard: 'target', self: 'self', disable: 'block' }[onError];
+      rows.push(['allow', onDeny, onError, 'target', 'allow']);
+      rows.push(['deny', onDeny, onError, denyAct, 'deny']);
+      rows.push(['notfound', onDeny, onError, denyAct, 'notfound']);
+      rows.push(['error', onDeny, onError, errAct, 'error']);
+      rows.push(['timeout', onDeny, onError, errAct, 'timeout']);
+    }
+  }
+  it.each(rows)('state=%s onDeny=%s onError=%s -> %s (%s)', (state, onDeny, onError, action, reason) => {
+    expect(decideLinkClick({ state, onDeny, onError })).toEqual({ action, reason });
+  });
+  it('不明な state は error として扱う', () => {
+    expect(decideLinkClick({ state: 'pending', onDeny: 'self', onError: 'standard' })).toEqual({ action: 'target', reason: 'error' });
+    expect(decideLinkClick({ state: 'pending', onDeny: 'self', onError: 'disable' })).toEqual({ action: 'block', reason: 'error' });
   });
 });
 

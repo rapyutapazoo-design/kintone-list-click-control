@@ -1,11 +1,11 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createListController } from '../src/desktop/dom.js';
+import { createListController, showToast, openBlankTab } from '../src/desktop/dom.js';
 import { normalize } from '../src/core/config.js';
 
 const HOST = 'x.cybozu.com';
 const flush = async () => {
-  for (let i = 0; i < 6; i++) await Promise.resolve();
+  for (let i = 0; i < 30; i++) await Promise.resolve();
 };
 
 const PROPS = {
@@ -45,12 +45,21 @@ function buildList(rows, { detailLink = true, custHref = (r) => `/k/2/show#recor
 function fakeAcl() {
   const pending = [];
   const api = {
-    peek: vi.fn(() => null),
+    states: new Map(),
+    peek: vi.fn((r) => api.states.get(api.cacheKey(r)) ?? null),
     cacheKey: (r) => `${r.appId}|${r.keyType}|${r.value}`,
-    check: vi.fn((reqs) => new Promise((resolve) => pending.push({ reqs, resolve }))),
+    check: vi.fn((reqs) => new Promise((resolve, reject) => pending.push({ reqs, resolve, reject }))),
+    /** 保留中の check の先頭（FIFO）を解決する。プリフェッチが 1 番目、クリック時が 2 番目 */
     resolveLast: (stateFn) => {
       const p = pending.shift();
       p.resolve(new Map(p.reqs.map((r) => [api.cacheKey(r), stateFn(r)])));
+    },
+    /** 保留中の check をすべて解決する */
+    resolveAll: (stateFn) => {
+      while (pending.length) api.resolveLast(stateFn);
+    },
+    rejectNext: (err = new Error('x')) => {
+      pending.shift().reject(err);
     },
   };
   return api;
@@ -60,6 +69,8 @@ function setup(over = {}, cfgOver = {}) {
   const list = over.list || buildList([{ id: 10, cust: 5 }, { id: 11, cust: 6 }]);
   const config = normalize({ rowClick: 'row', ...cfgOver });
   const navigate = vi.fn();
+  const tab = { blocked: false, go: vi.fn(), close: vi.fn() };
+  const toast = vi.fn();
   let sel = null;
   const deps = {
     platform: 'desktop',
@@ -71,12 +82,14 @@ function setup(over = {}, cfgOver = {}) {
     host: HOST,
     currentSpaceId: null,
     navigate,
+    openTab: vi.fn(() => tab),
+    toast,
     root: window,
     getSelection: () => sel,
     ...over.deps,
   };
   const controller = createListController(deps);
-  return { list, controller, navigate, deps, setSel: (s) => (sel = s) };
+  return { list, controller, navigate, deps, tab, toast, setSel: (s) => (sel = s) };
 }
 
 const click = (el, init = {}) => {
@@ -91,6 +104,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   controllers.forEach((c) => c.dispose());
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 const mk = (...a) => {
@@ -244,7 +258,7 @@ describe('権限判定', () => {
 
   it('href が解析できないキー型は currentSpaceId を使う', async () => {
     const acl = fakeAcl();
-    const list = buildList([{ id: 10, cust: 5 }], { custHref: () => null });
+    const list = buildList([{ id: 10, cust: 5 }], { custHref: () => '#' });
     const { controller } = mk({ list, deps: { aclChecker: acl, currentSpaceId: '5' } }, permCfg);
     controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
     await flush();
@@ -252,46 +266,41 @@ describe('権限判定', () => {
     expect(r.spaceId).toBe('5');
   });
 
-  it('標準動作へ戻るエラーの警告は 1 回の判定につき 1 回', async () => {
+  it("クリック時の error で onError:'standard' なら warn 1 回・元の href へ navigate", async () => {
     const acl = fakeAcl();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const { controller, list } = mk({ deps: { aclChecker: acl } }, permCfg);
+    const cfg = { permission: { enabled: true, onError: 'standard', targets: { lookup: true, recordLink: false } } };
+    const { controller, list, navigate } = mk({ deps: { aclChecker: acl } }, cfg);
     controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
     await flush();
-    acl.resolveLast(() => 'error');
+    click(list.cells.cust[0].querySelector('a'));
+    await flush();
+    acl.resolveAll(() => 'error');
     await flush();
     expect(warn).toHaveBeenCalledTimes(1);
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(navigate).toHaveBeenCalledWith('/k/2/show#record=5', 'same');
   });
 
-  it('pending -> deny -> 退避、allow -> 復元', async () => {
+  it('表示後は deny / notfound / pending のどれでも href・class・title・aria が元のまま', async () => {
     const acl = fakeAcl();
     const { controller, list } = mk({ deps: { aclChecker: acl } }, permCfg);
     controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
     await flush();
     const a0 = list.cells.cust[0].querySelector('a');
     const a1 = list.cells.cust[1].querySelector('a');
-    expect(a0.classList.contains('klc-acl-pending')).toBe(true);
-    expect(a0.getAttribute('aria-busy')).toBe('true');
-    expect(click(a0).defaultPrevented).toBe(true); // pending 中は抑止
-    expect(acl.check).toHaveBeenCalledTimes(1);
-
-    acl.resolveLast((r) => (r.value === '5' ? 'deny' : 'allow'));
+    const names = (a) => [...a.attributes].map((x) => x.name).sort();
+    // pending（判定中）
+    expect(names(a0)).toEqual(['class', 'href', 'title']);
+    expect(a0.getAttribute('href')).toBe('/k/2/show#record=5');
+    acl.resolveLast((r) => (r.value === '5' ? 'deny' : 'notfound'));
     await flush();
-    expect(a0.hasAttribute('href')).toBe(false);
-    expect(a0.getAttribute('data-klc-href')).toBe('/k/2/show#record=5');
-    expect(a0.classList.contains('klc-acl-denied')).toBe(true);
-    expect(a0.classList.contains('klc-acl-pending')).toBe(false);
-    expect(a0.getAttribute('aria-disabled')).toBe('true');
-    expect(a0.getAttribute('title')).toBe('遷移先レコードの閲覧権限がありません');
-    expect(click(a0).defaultPrevented).toBe(true);
-
-    // allow: href・title・class が元に戻る
-    expect(a1.getAttribute('href')).toBe('/k/2/show#record=6');
-    expect(a1.getAttribute('title')).toBe('orig');
-    expect(a1.className).toBe('lk');
-    expect(a1.hasAttribute('aria-busy')).toBe(false);
-    expect(a1.hasAttribute('data-klc-state')).toBe(false);
-    expect(click(a1).defaultPrevented).toBe(false);
+    for (const [a, h] of [[a0, '/k/2/show#record=5'], [a1, '/k/2/show#record=6']]) {
+      expect(names(a)).toEqual(['class', 'href', 'title']);
+      expect(a.getAttribute('href')).toBe(h);
+      expect(a.className).toBe('lk');
+      expect(a.getAttribute('title')).toBe('orig');
+    }
   });
 
   it('リンクフィールド（kintone レコード URL）も判定対象になる', async () => {
@@ -304,55 +313,54 @@ describe('権限判定', () => {
     expect(reqs.filter((r) => r.appId === '2')).toHaveLength(2);
   });
 
-  it('peek で解決済みの結果は即時反映される', async () => {
+  it('peek=deny ならプリフェッチの check は呼ばれず DOM も変わらず、クリックで同期的に自レコードへ遷移', async () => {
     const acl = fakeAcl();
     acl.peek = vi.fn(() => 'deny');
-    const { controller, list } = mk({ deps: { aclChecker: acl } }, permCfg);
+    const { controller, list, navigate } = mk({ deps: { aclChecker: acl } }, permCfg);
     controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
     await flush();
-    expect(list.cells.cust[0].querySelector('a').classList.contains('klc-acl-denied')).toBe(true);
+    const a = list.cells.cust[0].querySelector('a');
     expect(acl.check).not.toHaveBeenCalled();
-  });
-
-  it("onError:'standard' の error は allow 表示と warn", async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const acl = fakeAcl();
-    const { controller, list } = mk({ deps: { aclChecker: acl } }, permCfg);
-    controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
-    await flush();
-    acl.resolveLast(() => 'error');
-    await flush();
-    const a = list.cells.cust[0].querySelector('a');
+    expect(a.className).toBe('lk');
     expect(a.getAttribute('href')).toBe('/k/2/show#record=5');
-    expect(a.classList.contains('klc-acl-pending')).toBe(false);
-    expect(warn).toHaveBeenCalled();
+    const ev = click(a);
+    expect(ev.defaultPrevented).toBe(true);
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
   });
 
-  it("onError:'disable' の error は無効表示", async () => {
-    const acl = fakeAcl();
-    const cfg = { permission: { enabled: true, onError: 'disable', targets: { lookup: true, recordLink: false } } };
-    const { controller, list } = mk({ deps: { aclChecker: acl } }, cfg);
-    controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
-    await flush();
-    acl.resolveLast(() => 'error');
-    await flush();
-    const a = list.cells.cust[0].querySelector('a');
-    expect(a.hasAttribute('href')).toBe(false);
-    expect(a.getAttribute('title')).toBe('権限を確認できませんでした');
-    expect(a.classList.contains('klc-acl-denied')).toBe(true);
-  });
-
-  it('check が reject したら error 扱い', async () => {
+  it("クリック時の error で onError:'disable' なら navigate せずトースト", async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const acl = fakeAcl();
-    acl.check = vi.fn(() => Promise.reject(new Error('x')));
-    const { controller, list } = mk({ deps: { aclChecker: acl } }, permCfg);
+    const cfg = { permission: { enabled: true, onError: 'disable', targets: { lookup: true, recordLink: false } } };
+    const { controller, list, navigate, toast } = mk({ deps: { aclChecker: acl } }, cfg);
     controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
     await flush();
-    expect(list.cells.cust[0].querySelector('a').classList.contains('klc-acl-pending')).toBe(false);
+    click(list.cells.cust[0].querySelector('a'));
+    await flush();
+    acl.resolveAll(() => 'error');
+    await flush();
+    expect(navigate).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith('閲覧権限を確認できなかったため開けません');
   });
 
-  it('旧世代の結果は新 DOM にも切り離された旧 anchor にも適用されない', async () => {
+  it('クリック時の check が reject したら onError（既定 self）で自レコードへ遷移', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const acl = fakeAcl();
+    const { controller, list, navigate } = mk({ deps: { aclChecker: acl } }, permCfg);
+    controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
+    await flush();
+    click(list.cells.cust[0].querySelector('a'));
+    await flush();
+    acl.resolveLast(() => 'allow'); // プリフェッチ分
+    acl.rejectNext(); // クリック時の分
+    await flush();
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+    expect(list.cells.cust[0].querySelector('a').classList.contains('klc-acl-checking')).toBe(false);
+  });
+
+  it('再描画のあとも check は世代ごとに呼ばれ、どちらの DOM も変わらない', async () => {
     let current = buildList([{ id: 10, cust: 5 }]);
     const acl = fakeAcl();
     const { controller } = mk({ list: current, deps: { aclChecker: acl, getFieldElements: (c) => current.cells[c] || null } }, permCfg);
@@ -360,21 +368,18 @@ describe('権限判定', () => {
     await flush();
     const detached = current.cells.cust[0].querySelector('a');
 
-    // DOM 差し替え（改ページ等）後に 2 回目の index.show
     current = buildList([{ id: 20, cust: 8 }]);
     controller.onIndexShow({ viewType: 'list', viewId: 1, records: current.records });
     await flush();
     expect(acl.check).toHaveBeenCalledTimes(2);
     expect(detached.isConnected).toBe(false);
 
-    // 1 回目（旧世代）を deny で解決
-    acl.resolveLast(() => 'deny');
+    acl.resolveAll(() => 'deny');
     await flush();
     const newAnchor = current.cells.cust[0].querySelector('a');
-    expect(newAnchor.classList.contains('klc-acl-denied')).toBe(false);
-    expect(newAnchor.classList.contains('klc-acl-pending')).toBe(true);
+    expect(newAnchor.className).toBe('lk');
     expect(newAnchor.getAttribute('href')).toBe('/k/2/show#record=8');
-    expect(detached.classList.contains('klc-acl-denied')).toBe(false);
+    expect(detached.className).toBe('lk');
     expect(detached.getAttribute('href')).toBe('/k/2/show#record=5');
   });
 
@@ -443,68 +448,22 @@ describe('モバイル', () => {
   });
 });
 
-describe('無効リンクのクリック', () => {
+describe('リンククリック時の権限判定', () => {
   const permCfg = (extra = {}, perm = {}) => ({
     permission: { enabled: true, targets: { lookup: true, recordLink: false }, ...perm },
     ...extra,
   });
-  async function denied(state = 'deny', cfg = permCfg(), over = {}) {
+  const KEY0 = '2|id|5';
+  /** 表示 → プリフェッチ済みの状態にする */
+  async function shown(cfg = permCfg(), over = {}) {
     const acl = fakeAcl();
-    const s = mk({ deps: { aclChecker: acl, ...(over.deps || {}) } }, cfg);
+    const s = mk({ ...over, deps: { aclChecker: acl, ...(over.deps || {}) } }, cfg);
     s.controller.onIndexShow({ viewType: 'list', viewId: 1, records: s.list.records });
     await flush();
     s.acl = acl;
     s.a = s.list.cells.cust[0].querySelector('a');
-    s.resolve = async (st = state) => {
-      acl.resolveLast(() => st);
-      await flush();
-    };
     return s;
   }
-
-  it('deny: preventDefault され行遷移する', async () => {
-    const s = await denied();
-    await s.resolve('deny');
-    const ev = click(s.a);
-    expect(ev.defaultPrevented).toBe(true);
-    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
-  });
-
-  it('pending 中でも行遷移する', async () => {
-    const s = await denied();
-    expect(s.a.getAttribute('data-klc-state')).toBe('pending');
-    const ev = click(s.a);
-    expect(ev.defaultPrevented).toBe(true);
-    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
-  });
-
-  it('notfound: 無効表示・title・クリックで行遷移', async () => {
-    const s = await denied();
-    await s.resolve('notfound');
-    expect(s.a.getAttribute('data-klc-state')).toBe('notfound');
-    expect(s.a.classList.contains('klc-acl-denied')).toBe(true);
-    expect(s.a.hasAttribute('href')).toBe(false);
-    expect(s.a.getAttribute('data-klc-href')).toBe('/k/2/show#record=5');
-    expect(s.a.getAttribute('title')).toBe('リンク先のレコードが見つかりません');
-    click(s.a);
-    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
-  });
-
-  it("error + onError:'disable' でも行遷移する", async () => {
-    const s = await denied('error', permCfg({}, { onError: 'disable' }));
-    await s.resolve('error');
-    expect(s.a.getAttribute('data-klc-state')).toBe('error');
-    click(s.a);
-    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
-  });
-
-  it("rowClick:'default' では preventDefault のみで遷移しない", async () => {
-    const s = await denied('deny', permCfg({ rowClick: 'default' }));
-    await s.resolve('deny');
-    const ev = click(s.a);
-    expect(ev.defaultPrevented).toBe(true);
-    expect(s.navigate).not.toHaveBeenCalled();
-  });
 
   it("text モード: rowClick:'default' では遷移しない", async () => {
     const { controller, list, navigate } = mk({}, { rowClick: 'default', lookup: { mode: 'text' } });
@@ -515,68 +474,324 @@ describe('無効リンクのクリック', () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 
-  it('中クリックと Ctrl クリックは new', async () => {
-    const s = await denied();
-    await s.resolve('deny');
+  it('deny（キャッシュあり）: preventDefault され自レコードへフォールバック', async () => {
+    const s = await shown();
+    s.acl.states.set(KEY0, 'deny');
+    const ev = click(s.a);
+    expect(ev.defaultPrevented).toBe(true);
+    expect(s.navigate).toHaveBeenCalledTimes(1);
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+  });
+
+  it('notfound（キャッシュあり）: DOM は変わらず自レコードへ遷移', async () => {
+    const s = await shown();
+    s.acl.states.set(KEY0, 'notfound');
+    click(s.a);
+    expect(s.a.className).toBe('lk');
+    expect(s.a.getAttribute('href')).toBe('/k/2/show#record=5');
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+  });
+
+  it('rowClick:default でも row でも自レコードへ遷移し、行クリックは重ねて発火しない', async () => {
+    for (const rowClick of ['default', 'row']) {
+      document.body.innerHTML = '';
+      const s = await shown(permCfg({ rowClick }));
+      s.acl.states.set(KEY0, 'deny');
+      click(s.a);
+      expect(s.navigate).toHaveBeenCalledTimes(1);
+      expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+      s.controller.dispose();
+    }
+  });
+
+  it('allow（キャッシュあり）の same は素通し', async () => {
+    const s = await shown();
+    s.acl.states.set(KEY0, 'allow');
+    const ev = click(s.a);
+    expect(ev.defaultPrevented).toBe(false);
+    expect(s.navigate).not.toHaveBeenCalled();
+  });
+
+  it('allow（キャッシュあり）+ Ctrl は元のリンク先を new で開く（openTab は使わない）', async () => {
+    const s = await shown();
+    s.acl.states.set(KEY0, 'allow');
+    click(s.a, { ctrlKey: true });
+    expect(s.navigate).toHaveBeenCalledWith('/k/2/show#record=5', 'new');
+    expect(s.deps.openTab).not.toHaveBeenCalled();
+  });
+
+  it('キャッシュあり deny の中クリックと Ctrl クリックは自レコードを new で開く', async () => {
+    const s = await shown();
+    s.acl.states.set(KEY0, 'deny');
     click(s.a, { type: 'auxclick', button: 1 });
     expect(s.navigate).toHaveBeenLastCalledWith('/k/1/show#record=10', 'new');
     click(s.a, { ctrlKey: true });
     expect(s.navigate).toHaveBeenLastCalledWith('/k/1/show#record=10', 'new');
   });
 
-  it('テキスト選択中・行内に input があると遷移しない', async () => {
-    const s = await denied();
-    await s.resolve('deny');
-    const tr = s.a.closest('tr');
-    s.setSel({ toString: () => 'abc', anchorNode: s.a.firstChild });
+  it('自レコードの URL: ゲスト形式 / モバイル形式', async () => {
+    const list = buildList([{ id: 10, cust: 5 }], { detailLink: false });
+    const g = await shown(permCfg(), { list, deps: { currentSpaceId: '7' } });
+    g.acl.states.set('2|id|5', 'deny');
+    click(g.a);
+    expect(g.navigate).toHaveBeenCalledWith('/k/guest/7/1/show#record=10', 'same');
+
+    document.body.innerHTML = '';
+    const list2 = buildList([{ id: 10, cust: 5 }], { detailLink: false });
+    const acl = fakeAcl();
+    const m = mk({ list: list2, deps: { platform: 'mobile', aclChecker: acl } }, permCfg());
+    m.controller.onIndexShow({ records: list2.records });
+    await flush();
+    acl.states.set('2|id|5', 'deny');
+    const ev = click(list2.cells.cust[0].querySelector('a'));
+    expect(ev.defaultPrevented).toBe(true);
+    expect(m.navigate).toHaveBeenCalledWith('/k/m/1/show?record=10', 'same');
+  });
+
+  it('onDeny:disable: deny / notfound は navigate せずトースト', async () => {
+    const s = await shown(permCfg({}, { onDeny: 'disable' }));
+    s.acl.states.set(KEY0, 'deny');
     click(s.a);
     expect(s.navigate).not.toHaveBeenCalled();
-    s.setSel(null);
-    tr.appendChild(document.createElement('input'));
+    expect(s.toast).toHaveBeenLastCalledWith('ルックアップ先レコードの閲覧権限がないため開けません');
+    s.acl.states.set(KEY0, 'notfound');
     click(s.a);
     expect(s.navigate).not.toHaveBeenCalled();
+    expect(s.toast).toHaveBeenLastCalledWith('ルックアップ先のレコードが見つかりません');
   });
 
-  it('stopPropagation しない（bubble listener に届く）', async () => {
-    const s = await denied();
-    await s.resolve('deny');
-    const seen = vi.fn();
-    document.addEventListener('click', seen);
+  it('キャッシュなし: 判定中の表示が付き、allow で解決すると遷移して表示が外れる', async () => {
+    const s = await shown();
     click(s.a);
-    document.removeEventListener('click', seen);
-    expect(seen).toHaveBeenCalledTimes(1);
+    expect(s.a.classList.contains('klc-acl-checking')).toBe(true);
+    expect(s.a.getAttribute('aria-busy')).toBe('true');
+    expect(document.documentElement.classList.contains('klc-busy')).toBe(true);
+    expect(s.navigate).not.toHaveBeenCalled();
+    await flush();
+    s.acl.resolveAll(() => 'allow');
+    await flush();
+    expect(s.navigate).toHaveBeenCalledTimes(1);
+    expect(s.navigate).toHaveBeenCalledWith('/k/2/show#record=5', 'same');
+    expect(s.a.classList.contains('klc-acl-checking')).toBe(false);
+    expect(s.a.hasAttribute('aria-busy')).toBe(false);
+    expect(document.documentElement.classList.contains('klc-busy')).toBe(false);
   });
 
-  it('klc-row-link: rowClick:row で付き、allow に戻ると外れる。default では付かない', async () => {
-    const s = await denied();
-    await s.resolve('deny');
-    expect(s.a.classList.contains('klc-row-link')).toBe(true);
-    // allow へ戻る
-    s.controller.onIndexShow({ viewType: 'list', viewId: 1, records: s.list.records });
+  it('キャッシュなし → deny で解決すると自レコードへ遷移', async () => {
+    const s = await shown();
+    click(s.a);
     await flush();
-    s.acl.resolveLast(() => 'allow');
+    s.acl.resolveAll(() => 'deny');
     await flush();
-    expect(s.a.classList.contains('klc-row-link')).toBe(false);
-
-    const d = await denied('deny', permCfg({ rowClick: 'default' }));
-    await d.resolve('deny');
-    expect(d.a.classList.contains('klc-acl-denied')).toBe(true);
-    expect(d.a.classList.contains('klc-row-link')).toBe(false);
+    expect(s.navigate).toHaveBeenCalledTimes(1);
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
   });
 
-  it('allow のルックアップリンクは素通し', async () => {
-    const s = await denied();
-    await s.resolve('allow');
+  describe('タイムアウト', () => {
+    const run = async (onError) => {
+      vi.useFakeTimers();
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const s = await shown(permCfg({}, onError ? { onError } : {}));
+      click(s.a);
+      await vi.advanceTimersByTimeAsync(1499);
+      expect(s.navigate).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      return s;
+    };
+
+    it('onError=self（既定）: 自レコードへ。後から allow が届いても 1 回だけ', async () => {
+      const s = await run();
+      expect(s.navigate).toHaveBeenCalledTimes(1);
+      expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+      s.acl.resolveAll(() => 'allow');
+      await flush();
+      expect(s.navigate).toHaveBeenCalledTimes(1);
+    });
+
+    it('onError=standard: 元の href へ', async () => {
+      const s = await run('standard');
+      expect(s.navigate).toHaveBeenCalledTimes(1);
+      expect(s.navigate).toHaveBeenCalledWith('/k/2/show#record=5', 'same');
+      s.acl.resolveAll(() => 'allow');
+      await flush();
+      expect(s.navigate).toHaveBeenCalledTimes(1);
+    });
+
+    it('onError=disable: navigate せず error のトースト', async () => {
+      const s = await run('disable');
+      expect(s.navigate).not.toHaveBeenCalled();
+      expect(s.toast).toHaveBeenCalledWith('閲覧権限を確認できなかったため開けません');
+      s.acl.resolveAll(() => 'allow');
+      await flush();
+      expect(s.navigate).not.toHaveBeenCalled();
+    });
+  });
+
+  it('判定中の連打は無視され、check は 1 回・遷移も 1 回', async () => {
+    const s = await shown();
+    const before = s.acl.check.mock.calls.length;
+    click(s.a);
+    click(s.a);
+    click(s.a);
+    await flush();
+    expect(s.acl.check.mock.calls.length - before).toBe(1);
+    s.acl.resolveAll(() => 'deny');
+    await flush();
+    expect(s.navigate).toHaveBeenCalledTimes(1);
+  });
+
+  describe('新しいタブ（キャッシュなし）', () => {
+    const cases = [
+      ['Ctrl', { ctrlKey: true }, {}],
+      ['Meta', { metaKey: true }, {}],
+      ['Shift', { shiftKey: true }, {}],
+      ['auxclick button=1', { type: 'auxclick', button: 1 }, {}],
+      ['openMode:new', {}, { openMode: 'new' }],
+    ];
+    it.each(cases)('%s: クリック中に同期的に openTab し、解決後に tab.go', async (_n, init, extra) => {
+      const s = await shown(permCfg(extra));
+      const ev = click(s.a, init);
+      expect(s.deps.openTab).toHaveBeenCalledTimes(1);
+      if (init.type === 'auxclick') expect(ev.defaultPrevented).toBe(true);
+      await flush();
+      s.acl.resolveAll(() => 'allow');
+      await flush();
+      expect(s.tab.go).toHaveBeenCalledWith('/k/2/show#record=5');
+      expect(s.navigate).not.toHaveBeenCalled();
+    });
+
+    it('block（onDeny=disable + deny）: tab.close とトースト', async () => {
+      const s = await shown(permCfg({}, { onDeny: 'disable' }));
+      click(s.a, { ctrlKey: true });
+      await flush();
+      s.acl.resolveAll(() => 'deny');
+      await flush();
+      expect(s.tab.close).toHaveBeenCalledTimes(1);
+      expect(s.tab.go).not.toHaveBeenCalled();
+      expect(s.toast).toHaveBeenCalledWith('ルックアップ先レコードの閲覧権限がないため開けません');
+    });
+
+    it('ポップアップがブロックされたら navigate(url,new) とトースト', async () => {
+      const blocked = { blocked: true, go: vi.fn(), close: vi.fn() };
+      const s = await shown(permCfg(), { deps: { openTab: vi.fn(() => blocked) } });
+      click(s.a, { ctrlKey: true });
+      await flush();
+      s.acl.resolveAll(() => 'allow');
+      await flush();
+      expect(s.navigate).toHaveBeenCalledWith('/k/2/show#record=5', 'new');
+      expect(s.toast).toHaveBeenCalledWith('ポップアップがブロックされました。もう一度クリックしてください');
+    });
+  });
+
+  it('href なし: プリフェッチに含まれず、check せず同期的に自レコードへ（disable なら notfound のトースト）', async () => {
+    const list = buildList([{ id: 10, cust: 5 }], { custHref: () => null });
+    const s = await shown(permCfg(), { list });
+    expect(s.acl.check).not.toHaveBeenCalled();
+    click(s.a);
+    expect(s.acl.check).not.toHaveBeenCalled();
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+
+    document.body.innerHTML = '';
+    const list2 = buildList([{ id: 10, cust: 5 }], { custHref: () => null });
+    const d = await shown(permCfg({}, { onDeny: 'disable' }), { list: list2 });
+    click(d.a);
+    expect(d.navigate).not.toHaveBeenCalled();
+    expect(d.toast).toHaveBeenCalledWith('ルックアップ先のレコードが見つかりません');
+  });
+
+  it('javascript: の href には介入しない', async () => {
+    const list = buildList([{ id: 10, cust: 5 }], { custHref: () => 'javascript:void(0)' });
+    const s = await shown(permCfg(), { list });
+    const before = s.acl.check.mock.calls.length;
     const ev = click(s.a);
     expect(ev.defaultPrevented).toBe(false);
     expect(s.navigate).not.toHaveBeenCalled();
+    expect(s.acl.check.mock.calls.length).toBe(before);
   });
 
-  it('モバイルでは preventDefault のみで遷移しない', async () => {
-    const s = await denied('deny', permCfg(), { deps: { platform: 'mobile' } });
-    await s.resolve('deny');
-    const ev = click(s.a);
+  it('permission.enabled:false では check せず、クリックは素通し', async () => {
+    const acl = fakeAcl();
+    const { controller, list, navigate } = mk({ deps: { aclChecker: acl } }, { permission: { enabled: false } });
+    controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
+    await flush();
+    expect(acl.check).not.toHaveBeenCalled();
+    const ev = click(list.cells.cust[0].querySelector('a'));
+    expect(ev.defaultPrevented).toBe(false);
+    expect(navigate).not.toHaveBeenCalled();
+    // lookup mode=self と text の挙動は 'ルックアップ' の describe（既存テスト）で担保
+  });
+
+  it('recordLink の deny でも自レコードへ遷移する', async () => {
+    const s = await shown({ permission: { enabled: true, targets: { lookup: true, recordLink: true } } });
+    s.acl.states.set('3|id|5', 'deny');
+    const ev = click(s.list.cells.link[0].querySelector('a'));
     expect(ev.defaultPrevented).toBe(true);
-    expect(s.navigate).not.toHaveBeenCalled();
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+  });
+
+  it('プリフェッチ: 表示時に check が 1 回呼ばれ、deny で解決しても anchor の属性は変わらない', async () => {
+    const s = await shown();
+    expect(s.acl.check).toHaveBeenCalledTimes(1);
+    s.acl.resolveAll(() => 'deny');
+    await flush();
+    expect(s.a.getAttribute('href')).toBe('/k/2/show#record=5');
+    expect(s.a.className).toBe('lk');
+    expect(s.a.getAttribute('title')).toBe('orig');
+    expect([...s.a.attributes].map((x) => x.name).sort()).toEqual(['class', 'href', 'title']);
+  });
+});
+
+describe('showToast', () => {
+  it('要素を使い回し、textContent のみ、3 秒後に hidden', () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = '';
+    showToast(document, '<b>x</b>');
+    showToast(document, '<b>y</b>');
+    const els = document.querySelectorAll('div.klc-toast');
+    expect(els).toHaveLength(1);
+    const el = els[0];
+    expect(el.getAttribute('role')).toBe('status');
+    expect(el.getAttribute('aria-live')).toBe('polite');
+    expect(el.children).toHaveLength(0);
+    expect(el.textContent).toBe('<b>y</b>');
+    expect(el.hidden).toBe(false);
+    vi.advanceTimersByTime(2999);
+    expect(el.hidden).toBe(false);
+    vi.advanceTimersByTime(1);
+    expect(el.hidden).toBe(true);
+  });
+});
+
+describe('openBlankTab', () => {
+  const mkWin = (w) => ({ open: vi.fn(() => w), location: { href: 'https://x.cybozu.com/k/1/' } });
+  const mkTab = () => ({ opener: 'x', closed: false, location: { replace: vi.fn() }, close: vi.fn() });
+
+  it('空タブを開き opener=null、go は location.replace', () => {
+    const w = mkTab();
+    const win = mkWin(w);
+    const t = openBlankTab(win);
+    expect(win.open).toHaveBeenCalledWith('', '_blank');
+    expect(w.opener).toBeNull();
+    expect(t.blocked).toBe(false);
+    t.go('/k/2/show#record=5');
+    expect(w.location.replace).toHaveBeenCalledWith('https://x.cybozu.com/k/2/show#record=5');
+  });
+
+  it('closed なら replace しない。close() が呼ばれる', () => {
+    const w = mkTab();
+    const t = openBlankTab(mkWin(w));
+    w.closed = true;
+    t.go('/k/2/show#record=5');
+    expect(w.location.replace).not.toHaveBeenCalled();
+    w.closed = false;
+    t.close();
+    expect(w.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('open が null を返すか throw したら blocked', () => {
+    expect(openBlankTab({ open: () => null, location: { href: 'https://x/' } }).blocked).toBe(true);
+    expect(
+      openBlankTab({ open: () => { throw new Error('x'); }, location: { href: 'https://x/' } }).blocked,
+    ).toBe(true);
   });
 });

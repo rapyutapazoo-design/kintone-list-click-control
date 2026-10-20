@@ -23,6 +23,33 @@
 a.klc-row-link {
   cursor: pointer;
 }
+/* クリック時の権限判定中 */
+a.klc-acl-checking {
+  opacity: 0.6;
+  cursor: progress;
+}
+html.klc-busy,
+html.klc-busy * {
+  cursor: progress !important;
+}
+.klc-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 10000;
+  max-width: calc(100vw - 32px);
+  padding: 10px 16px;
+  border-radius: 4px;
+  background: rgba(51, 51, 51, 0.92);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1.5;
+  pointer-events: none;
+}
+.klc-toast[hidden] {
+  display: none;
+}
 
 /* 設定画面 */
 .klc-config {

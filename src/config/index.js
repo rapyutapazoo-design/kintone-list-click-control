@@ -149,7 +149,7 @@ import { getGuestSpaceIdFromPath } from '../core/url.js';
   if (cfg.permission.targets.recordLink) permValue.push('recordLink');
   const perm = new Checkbox({
     items: [
-      { label: '遷移先の閲覧権限がないリンクを無効にする', value: 'enabled' },
+      { label: 'クリック時に遷移先の閲覧権限を確認する', value: 'enabled' },
       { label: '対象: ルックアップのリンク', value: 'lookup' },
       { label: '対象: kintone のレコード URL を持つ「リンク」フィールド', value: 'recordLink' },
     ],
@@ -158,15 +158,26 @@ import { getGuestSpaceIdFromPath } from '../core/url.js';
   });
   s.appendChild(perm);
   note(s, 'この判定は表示上の補助です。実際の閲覧可否は kintone の権限設定で保証されます。');
-  const onError = new RadioButton({
-    label: '権限を確認できなかったとき（通信エラー・タイムアウトなど）',
+  const onDeny = new RadioButton({
+    label: 'ルックアップ先（リンク先）を閲覧できない・見つからない場合',
     items: [
-      { label: '標準のリンクに戻す（業務を止めない）', value: 'standard' },
-      { label: 'リンクを無効にする（厳格）', value: 'disable' },
+      { label: '自分のレコードの詳細を開く', value: 'self' },
+      { label: 'リンクを無効にする（開かずに理由を表示）', value: 'disable' },
+    ],
+    value: cfg.permission.onDeny,
+  });
+  s.appendChild(onDeny);
+  const onError = new RadioButton({
+    label: '権限を確認できなかったとき（通信エラー・1.5 秒以内に確認できないときなど）',
+    items: [
+      { label: '自分のレコードの詳細を開く', value: 'self' },
+      { label: '標準のリンク先を開く', value: 'standard' },
+      { label: '開かない（厳格）', value: 'disable' },
     ],
     value: cfg.permission.onError,
   });
   s.appendChild(onError);
+  note(s, '一覧の見た目は変わりません。クリックしたときに確認し、結果は一定時間記憶します。右クリックの『新しいタブで開く』は kintone 標準のリンク先のままです。');
   const ttl = new Text({ label: '判定結果のキャッシュ時間（秒、0〜3600。0でキャッシュしない）', value: String(cfg.permission.cacheTtlSec) });
   s.appendChild(ttl);
   note(s, '表示のたびに API を呼ばないよう、結果を一定時間記憶します。参照先レコードの名前などの値は保存せず、レコード ID ベースの結果のみブラウザのセッションに保存します。');
@@ -206,6 +217,7 @@ import { getGuestSpaceIdFromPath } from '../core/url.js';
       permEnabled: perm.value.includes('enabled'),
       permLookup: perm.value.includes('lookup'),
       permRecordLink: perm.value.includes('recordLink'),
+      onDeny: onDeny.value,
       onError: onError.value,
       cacheTtlSec: ttlText,
     });

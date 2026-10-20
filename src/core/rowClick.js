@@ -32,3 +32,19 @@ export function resolveOpenMode({ openMode, ctrlKey, metaKey, shiftKey, button }
   if (ctrlKey || metaKey || shiftKey || button === 1) return 'new';
   return openMode === 'new' ? 'new' : 'same';
 }
+
+/**
+ * リンクのクリック時に遷移先を決める（純粋関数）。
+ * @param {{state: 'allow'|'deny'|'notfound'|'error'|'timeout', onDeny: 'self'|'disable', onError: 'standard'|'self'|'disable'}} p
+ * @returns {{action: 'target'|'self'|'block', reason: 'allow'|'deny'|'notfound'|'error'|'timeout'}}
+ */
+export function decideLinkClick({ state, onDeny, onError }) {
+  if (state === 'allow') return { action: 'target', reason: 'allow' };
+  if (state === 'deny' || state === 'notfound') {
+    return { action: onDeny === 'disable' ? 'block' : 'self', reason: state };
+  }
+  const reason = state === 'timeout' ? 'timeout' : 'error';
+  if (onError === 'standard') return { action: 'target', reason };
+  if (onError === 'disable') return { action: 'block', reason };
+  return { action: 'self', reason };
+}
