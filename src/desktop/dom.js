@@ -4,27 +4,30 @@
  */
 import { isTargetView, resolveLookupMode, loadConfig } from '../core/config.js';
 import { parseRecordUrl, buildRecordUrl, getGuestSpaceIdFromPath, getGuestSpaceIdFromApiUrl } from '../core/url.js';
-import { createAclChecker, createKintoneFetcher } from '../core/acl.js';
+import { createAclChecker, createKintoneFetcher, createKintoneRecordFetcher } from '../core/acl.js';
 import { decideRowClick, resolveOpenMode, INTERACTIVE_SELECTOR } from '../core/rowClick.js';
 
 const MSG_PENDING = '遷移先の権限を確認しています…';
 const MSG_DENY = '遷移先レコードの閲覧権限がありません';
 const MSG_ERROR = '権限を確認できませんでした';
+const MSG_NOTFOUND = 'リンク先のレコードが見つかりません';
 
 const CLS_PENDING = 'klc-acl-pending';
 const CLS_DENIED = 'klc-acl-denied';
 const CLS_TEXT = 'klc-lookup-text';
 const CLS_ROW = 'klc-row-clickable';
+const CLS_ROWLINK = 'klc-row-link';
 const ATTR_STATE = 'data-klc-state';
 const ATTR_HREF = 'data-klc-href';
 const ATTR_TITLE = 'data-klc-title';
+const DISABLED_STATES = new Set(['pending', 'deny', 'notfound', 'error', 'text']);
 
 /** @param {HTMLAnchorElement} a */
 export function applyPending(a) {
   if (!a.hasAttribute(ATTR_STATE) && a.hasAttribute('title')) {
     a.setAttribute(ATTR_TITLE, a.getAttribute('title'));
   }
-  a.classList.remove(CLS_DENIED, CLS_TEXT);
+  a.classList.remove(CLS_DENIED, CLS_TEXT, CLS_ROWLINK);
   a.classList.add(CLS_PENDING);
   a.setAttribute('aria-busy', 'true');
   a.setAttribute('title', MSG_PENDING);
@@ -34,7 +37,7 @@ export function applyPending(a) {
 /** @param {HTMLAnchorElement} a */
 export function applyAllow(a) {
   const state = a.getAttribute(ATTR_STATE);
-  a.classList.remove(CLS_PENDING, CLS_DENIED, CLS_TEXT);
+  a.classList.remove(CLS_PENDING, CLS_DENIED, CLS_TEXT, CLS_ROWLINK);
   a.removeAttribute('aria-busy');
   a.removeAttribute('aria-disabled');
   if (a.hasAttribute(ATTR_HREF)) {
@@ -54,7 +57,7 @@ export function applyAllow(a) {
 
 /**
  * @param {HTMLAnchorElement} a
- * @param {'deny'|'text'|'error'} reason
+ * @param {'deny'|'notfound'|'text'|'error'} reason
  */
 export function applyDisabled(a, reason) {
   if (!a.hasAttribute(ATTR_STATE) && reason !== 'text' && a.hasAttribute('title')) {
@@ -64,11 +67,12 @@ export function applyDisabled(a, reason) {
     a.setAttribute(ATTR_HREF, a.getAttribute('href'));
   }
   a.removeAttribute('href');
-  a.classList.remove(CLS_PENDING, CLS_DENIED, CLS_TEXT);
+  a.classList.remove(CLS_PENDING, CLS_DENIED, CLS_TEXT, CLS_ROWLINK);
   a.removeAttribute('aria-busy');
   a.classList.add(reason === 'text' ? CLS_TEXT : CLS_DENIED);
   a.setAttribute('aria-disabled', 'true');
   if (reason === 'deny') a.setAttribute('title', MSG_DENY);
+  else if (reason === 'notfound') a.setAttribute('title', MSG_NOTFOUND);
   else if (reason === 'error') a.setAttribute('title', MSG_ERROR);
   else if (a.getAttribute(ATTR_STATE) === 'pending') a.removeAttribute('title');
   a.setAttribute(ATTR_STATE, reason === 'text' ? 'text' : reason);
@@ -184,7 +188,7 @@ export function createListController(deps) {
         if (isLookup) {
           const mode = resolveLookupMode(config, code);
           anchorInfo.set(anchor, { kind: 'lookup', fieldCode: code, rowRecordId: String(rowRecordId), mode });
-          if (mode === 'text') return applyDisabled(anchor, 'text');
+          if (mode === 'text') return disable(anchor, 'text');
           if (mode === 'self') return;
           if (!(permOn && config.permission.targets.lookup)) return;
           const lk = prop.lookup;
@@ -218,11 +222,19 @@ export function createListController(deps) {
     return entries;
   }
 
+  const rowMode = platform === 'desktop' && config.rowClick === 'row';
+  /** 無効化し、rowClick=row の行内では cursor を pointer にするクラスを付ける */
+  function disable(anchor, reason) {
+    applyDisabled(anchor, reason);
+    if (rowMode) anchor.classList.add(CLS_ROWLINK);
+  }
+
   function applyState(anchor, state, onStandardError) {
     if (state === 'allow') return applyAllow(anchor);
-    if (state === 'deny') return applyDisabled(anchor, 'deny');
+    if (state === 'deny') return disable(anchor, 'deny');
+    if (state === 'notfound') return disable(anchor, 'notfound');
     // error
-    if (config.permission.onError === 'disable') return applyDisabled(anchor, 'error');
+    if (config.permission.onError === 'disable') return disable(anchor, 'error');
     if (onStandardError) onStandardError();
     applyAllow(anchor);
   }
@@ -238,7 +250,7 @@ export function createListController(deps) {
     const unresolved = [];
     for (const e of entries) {
       const s = aclChecker.peek(e.req);
-      if (s === 'allow' || s === 'deny') applyState(e.anchor, s);
+      if (s === 'allow' || s === 'deny' || s === 'notfound') applyState(e.anchor, s);
       else {
         applyPending(e.anchor);
         unresolved.push(e);
@@ -316,14 +328,14 @@ export function createListController(deps) {
 
     const a = target.closest('a');
     const info = a ? anchorInfo.get(a) : null;
+    let disabledAnchor = null;
     if (a && info) {
       const state = a.getAttribute(ATTR_STATE);
-      if (state === 'pending' || state === 'deny' || state === 'error' || state === 'text') {
+      if (DISABLED_STATES.has(state)) {
+        // リンク遷移だけ止める（stopPropagation はしない）。行クリック判定へ回す
         e.preventDefault();
-        e.stopPropagation();
-        return;
-      }
-      if (info.mode === 'self' && info.kind === 'lookup') {
+        disabledAnchor = a;
+      } else if (info.mode === 'self' && info.kind === 'lookup') {
         e.preventDefault();
         e.stopPropagation();
         const appId = deps.getAppId();
@@ -332,8 +344,9 @@ export function createListController(deps) {
           buildRecordUrl({ appId, recordId: info.rowRecordId, spaceId: currentSpaceId, platform });
         deps.navigate(url, openModeOf(e));
         return;
+      } else {
+        return; // standard: 素通し
       }
-      return; // standard: 素通し
     }
 
     if (platform !== 'desktop') return;
@@ -342,7 +355,10 @@ export function createListController(deps) {
     if (!tr || !row) return;
     const td = target.closest('td');
     const sel = deps.getSelection ? deps.getSelection() : null;
-    const interactive = target.closest(INTERACTIVE_SELECTOR);
+    let interactive = target.closest(INTERACTIVE_SELECTOR);
+    if (disabledAnchor && interactive === disabledAnchor) {
+      interactive = disabledAnchor.parentElement ? disabledAnchor.parentElement.closest(INTERACTIVE_SELECTOR) : null;
+    }
     const decision = decideRowClick({
       targetView,
       rowClick: config.rowClick,
@@ -412,6 +428,7 @@ export function setupEntry({ platform, eventName, kintone, getAppId, getFieldEle
   const aclChecker = config.permission.enabled
     ? createAclChecker({
         fetcher: createKintoneFetcher(kintone),
+        recordFetcher: createKintoneRecordFetcher(kintone),
         host: location.host,
         ttlSec: config.permission.cacheTtlSec,
         storage: safeSessionStorage(),
