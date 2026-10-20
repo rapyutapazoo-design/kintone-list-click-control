@@ -19,6 +19,10 @@
   text-decoration: none !important;
   cursor: text;
 }
+/* rowClick=row の行内では、無効リンクも行として押せることを示す */
+a.klc-row-link {
+  cursor: pointer;
+}
 
 /* 設定画面 */
 .klc-config {

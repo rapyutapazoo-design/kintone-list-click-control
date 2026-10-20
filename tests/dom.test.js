@@ -204,7 +204,7 @@ describe('ルックアップ', () => {
     expect(a.classList.contains('klc-lookup-text')).toBe(true);
     const ev = click(a);
     expect(ev.defaultPrevented).toBe(true);
-    expect(navigate).not.toHaveBeenCalled(); // 行遷移にも波及しない
+    expect(navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same'); // 無効リンクのクリックは行遷移に回る
   });
 
   it('個別設定が全体設定より優先される', async () => {
@@ -440,5 +440,143 @@ describe('モバイル', () => {
     click(inner);
     click(inner.parentElement);
     expect(navigate).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('無効リンクのクリック', () => {
+  const permCfg = (extra = {}, perm = {}) => ({
+    permission: { enabled: true, targets: { lookup: true, recordLink: false }, ...perm },
+    ...extra,
+  });
+  async function denied(state = 'deny', cfg = permCfg(), over = {}) {
+    const acl = fakeAcl();
+    const s = mk({ deps: { aclChecker: acl, ...(over.deps || {}) } }, cfg);
+    s.controller.onIndexShow({ viewType: 'list', viewId: 1, records: s.list.records });
+    await flush();
+    s.acl = acl;
+    s.a = s.list.cells.cust[0].querySelector('a');
+    s.resolve = async (st = state) => {
+      acl.resolveLast(() => st);
+      await flush();
+    };
+    return s;
+  }
+
+  it('deny: preventDefault され行遷移する', async () => {
+    const s = await denied();
+    await s.resolve('deny');
+    const ev = click(s.a);
+    expect(ev.defaultPrevented).toBe(true);
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+  });
+
+  it('pending 中でも行遷移する', async () => {
+    const s = await denied();
+    expect(s.a.getAttribute('data-klc-state')).toBe('pending');
+    const ev = click(s.a);
+    expect(ev.defaultPrevented).toBe(true);
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+  });
+
+  it('notfound: 無効表示・title・クリックで行遷移', async () => {
+    const s = await denied();
+    await s.resolve('notfound');
+    expect(s.a.getAttribute('data-klc-state')).toBe('notfound');
+    expect(s.a.classList.contains('klc-acl-denied')).toBe(true);
+    expect(s.a.hasAttribute('href')).toBe(false);
+    expect(s.a.getAttribute('data-klc-href')).toBe('/k/2/show#record=5');
+    expect(s.a.getAttribute('title')).toBe('リンク先のレコードが見つかりません');
+    click(s.a);
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+  });
+
+  it("error + onError:'disable' でも行遷移する", async () => {
+    const s = await denied('error', permCfg({}, { onError: 'disable' }));
+    await s.resolve('error');
+    expect(s.a.getAttribute('data-klc-state')).toBe('error');
+    click(s.a);
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+  });
+
+  it("rowClick:'default' では preventDefault のみで遷移しない", async () => {
+    const s = await denied('deny', permCfg({ rowClick: 'default' }));
+    await s.resolve('deny');
+    const ev = click(s.a);
+    expect(ev.defaultPrevented).toBe(true);
+    expect(s.navigate).not.toHaveBeenCalled();
+  });
+
+  it("text モード: rowClick:'default' では遷移しない", async () => {
+    const { controller, list, navigate } = mk({}, { rowClick: 'default', lookup: { mode: 'text' } });
+    controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
+    await flush();
+    const ev = click(list.cells.cust[0].querySelector('a'));
+    expect(ev.defaultPrevented).toBe(true);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it('中クリックと Ctrl クリックは new', async () => {
+    const s = await denied();
+    await s.resolve('deny');
+    click(s.a, { type: 'auxclick', button: 1 });
+    expect(s.navigate).toHaveBeenLastCalledWith('/k/1/show#record=10', 'new');
+    click(s.a, { ctrlKey: true });
+    expect(s.navigate).toHaveBeenLastCalledWith('/k/1/show#record=10', 'new');
+  });
+
+  it('テキスト選択中・行内に input があると遷移しない', async () => {
+    const s = await denied();
+    await s.resolve('deny');
+    const tr = s.a.closest('tr');
+    s.setSel({ toString: () => 'abc', anchorNode: s.a.firstChild });
+    click(s.a);
+    expect(s.navigate).not.toHaveBeenCalled();
+    s.setSel(null);
+    tr.appendChild(document.createElement('input'));
+    click(s.a);
+    expect(s.navigate).not.toHaveBeenCalled();
+  });
+
+  it('stopPropagation しない（bubble listener に届く）', async () => {
+    const s = await denied();
+    await s.resolve('deny');
+    const seen = vi.fn();
+    document.addEventListener('click', seen);
+    click(s.a);
+    document.removeEventListener('click', seen);
+    expect(seen).toHaveBeenCalledTimes(1);
+  });
+
+  it('klc-row-link: rowClick:row で付き、allow に戻ると外れる。default では付かない', async () => {
+    const s = await denied();
+    await s.resolve('deny');
+    expect(s.a.classList.contains('klc-row-link')).toBe(true);
+    // allow へ戻る
+    s.controller.onIndexShow({ viewType: 'list', viewId: 1, records: s.list.records });
+    await flush();
+    s.acl.resolveLast(() => 'allow');
+    await flush();
+    expect(s.a.classList.contains('klc-row-link')).toBe(false);
+
+    const d = await denied('deny', permCfg({ rowClick: 'default' }));
+    await d.resolve('deny');
+    expect(d.a.classList.contains('klc-acl-denied')).toBe(true);
+    expect(d.a.classList.contains('klc-row-link')).toBe(false);
+  });
+
+  it('allow のルックアップリンクは素通し', async () => {
+    const s = await denied();
+    await s.resolve('allow');
+    const ev = click(s.a);
+    expect(ev.defaultPrevented).toBe(false);
+    expect(s.navigate).not.toHaveBeenCalled();
+  });
+
+  it('モバイルでは preventDefault のみで遷移しない', async () => {
+    const s = await denied('deny', permCfg(), { deps: { platform: 'mobile' } });
+    await s.resolve('deny');
+    const ev = click(s.a);
+    expect(ev.defaultPrevented).toBe(true);
+    expect(s.navigate).not.toHaveBeenCalled();
   });
 });
