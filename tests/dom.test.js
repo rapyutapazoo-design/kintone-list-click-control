@@ -15,7 +15,7 @@ const PROPS = {
 };
 
 /** 行ごとの DOM を作り、field code -> td 配列 を返す */
-function buildList(rows, { detailLink = true, custHref = (r) => `/k/2/show#record=${r.cust}`, linkHref = (r) => `/k/3/show#record=${r.cust}` } = {}) {
+function buildList(rows, { detailLink = true, custHref = (r) => `/k/2/show#record=${r.cust}`, linkHref = (r) => `/k/3/show#record=${r.cust}`, custType = null } = {}) {
   document.body.innerHTML = '<table><tbody></tbody></table>';
   const tbody = document.querySelector('tbody');
   const cells = { text: [], cust: [], link: [] };
@@ -37,7 +37,7 @@ function buildList(rows, { detailLink = true, custHref = (r) => `/k/2/show#recor
     cells.text.push(tdText);
     cells.cust.push(tdCust);
     cells.link.push(tdLink);
-    records.push({ $id: { value: String(r.id) }, text: {}, cust: {}, link: {} });
+    records.push({ $id: { value: String(r.id) }, text: {}, cust: custType ? { type: custType } : {}, link: {} });
   }
   return { cells, records, icons: [...tbody.querySelectorAll('tr')].map((tr) => tr.firstChild) };
 }
@@ -831,6 +831,159 @@ describe('リンククリック時の権限判定', () => {
     expect(s.a.className).toBe('lk');
     expect(s.a.getAttribute('title')).toBe('orig');
     expect([...s.a.attributes].map((x) => x.name).sort()).toEqual(['class', 'href', 'title']);
+  });
+});
+
+describe('DOM 由来のルックアップ判定', () => {
+  const permCfg = (extra = {}) => ({ permission: { enabled: true, targets: { lookup: true, recordLink: false } }, ...extra });
+  const KEY0 = '2|id|5';
+  async function shown({ fields = async () => ({}), custType = 'SINGLE_LINE_TEXT', listOpts = {}, cfg = permCfg(), deps = {} } = {}) {
+    const acl = fakeAcl();
+    const list = buildList([{ id: 10, cust: 5 }, { id: 11, cust: 6 }], { custType, ...listOpts });
+    const s = mk({ list, deps: { aclChecker: acl, fetchFormFields: fields, ...deps } }, cfg);
+    s.controller.onIndexShow({ viewType: 'list', viewId: 1, records: list.records });
+    await flush();
+    s.acl = acl;
+    s.a = list.cells.cust[0].querySelector('a');
+    return s;
+  }
+  const prefetched = (s) => (s.acl.check.mock.calls[0] || [[]])[0].find((r) => r.appId === '2');
+
+  it('lookup 無しの fields.json でもプリフェッチされ、deny でリンク・子要素クリックが自レコードへ', async () => {
+    const s = await shown({ fields: async () => ({ cust: { type: 'SINGLE_LINE_TEXT' } }) });
+    expect(prefetched(s)).toMatchObject({ appId: '2', keyType: 'id', value: '5' });
+    s.acl.states.set(KEY0, 'deny');
+    const ev = click(s.a);
+    expect(ev.defaultPrevented).toBe(true);
+    expect(s.navigate).toHaveBeenCalledTimes(1);
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+    s.a.innerHTML = '<span class="in">顧客</span>';
+    click(s.a.querySelector('.in'));
+    expect(s.navigate).toHaveBeenCalledTimes(2);
+  });
+
+  it('fields.json が reject しても動く', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const s = await shown({ fields: async () => { throw new Error('x'); } });
+    expect(prefetched(s)).toMatchObject({ keyType: 'id', value: '5' });
+    s.acl.states.set(KEY0, 'deny');
+    click(s.a);
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+    expect(warn.mock.calls.length).toBeLessThanOrEqual(1);
+  });
+
+  it('fields.json が {} でも records の type で判定できる', async () => {
+    const s = await shown({ fields: async () => ({}) });
+    s.acl.states.set(KEY0, 'deny');
+    click(s.a);
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+  });
+
+  it('NUMBER 型', async () => {
+    const s = await shown({ custType: 'NUMBER' });
+    s.acl.states.set(KEY0, 'deny');
+    click(s.a);
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+  });
+
+  it('td 余白クリックは行クリックで1回だけ遷移（row / default）', async () => {
+    for (const rowClick of ['row', 'default']) {
+      document.body.innerHTML = '';
+      const s = await shown({ cfg: permCfg({ rowClick }) });
+      s.acl.states.set(KEY0, 'deny');
+      click(s.a);
+      expect(s.navigate).toHaveBeenCalledTimes(1);
+      if (rowClick === 'row') {
+        click(s.list.cells.cust[0]);
+        expect(s.navigate).toHaveBeenCalledTimes(2);
+      }
+      s.controller.dispose();
+    }
+  });
+
+  it("rowClick:'default': ルックアップ td の余白（リンク外）クリックでは遷移も介入もしない", async () => {
+    const s = await shown({ cfg: permCfg({ rowClick: 'default' }) });
+    s.acl.states.set(KEY0, 'deny');
+    const ev = click(s.list.cells.cust[0]);
+    expect(s.navigate).not.toHaveBeenCalled();
+    expect(ev.defaultPrevented).toBe(false);
+  });
+
+  it('ACL 未キャッシュ: クリック時に check し deny / notfound で自レコードへ、disable は toast', async () => {
+    for (const st of ['deny', 'notfound']) {
+      document.body.innerHTML = '';
+      const s = await shown();
+      const ev = click(s.a);
+      expect(ev.defaultPrevented).toBe(true);
+      await flush();
+      s.acl.resolveAll(() => st);
+      await flush();
+      expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+      s.controller.dispose();
+    }
+    document.body.innerHTML = '';
+    const d = await shown({ cfg: permCfg({ permission: { enabled: true, onDeny: 'disable', targets: { lookup: true, recordLink: false } } }) });
+    click(d.a);
+    await flush();
+    d.acl.resolveAll(() => 'deny');
+    await flush();
+    expect(d.navigate).not.toHaveBeenCalled();
+    expect(d.toast).toHaveBeenCalled();
+  });
+
+  it('allow は素通し', async () => {
+    const s = await shown();
+    s.acl.states.set(KEY0, 'allow');
+    const ev = click(s.a);
+    expect(ev.defaultPrevented).toBe(false);
+    expect(s.navigate).not.toHaveBeenCalled();
+  });
+
+  it('誤判定しない: 同一アプリ宛 / LINK・RICH_TEXT・MULTI_LINE_TEXT / recordId なし', async () => {
+    const same = await shown({ listOpts: { custHref: (r) => '/k/1/show#record=' + r.cust } });
+    expect(prefetched(same)).toBeUndefined();
+    expect(click(same.a).defaultPrevented).toBe(false);
+    for (const t of ['LINK', 'RICH_TEXT', 'MULTI_LINE_TEXT']) {
+      document.body.innerHTML = '';
+      const s = await shown({ custType: t });
+      expect(s.acl.check).not.toHaveBeenCalled();
+      expect(click(s.a).defaultPrevented).toBe(false);
+      s.controller.dispose();
+    }
+    document.body.innerHTML = '';
+    const nr = await shown({ listOpts: { custHref: () => '/k/2/show' } });
+    expect(nr.acl.check).not.toHaveBeenCalled();
+    expect(click(nr.a).defaultPrevented).toBe(false);
+  });
+
+  it('別ホストの href はルックアップ扱いにならない', async () => {
+    const s = await shown({ listOpts: { custHref: (r) => 'https://other.example.com/k/2/show#record=' + r.cust } });
+    expect(prefetched(s)).toBeUndefined();
+    expect(s.acl.check).not.toHaveBeenCalled();
+    const ev = click(s.a);
+    expect(ev.defaultPrevented).toBe(false);
+    expect(s.navigate).not.toHaveBeenCalled();
+  });
+
+  it('lookup mode: text / self が fields.json 非依存で効く', async () => {
+    const t = await shown({ cfg: permCfg({ lookup: { mode: 'text' } }) });
+    expect(t.a.hasAttribute('href')).toBe(false);
+    expect(click(t.a).defaultPrevented).toBe(true);
+    document.body.innerHTML = '';
+    const s = await shown({ cfg: permCfg({ lookup: { mode: 'self' } }) });
+    expect(click(s.a).defaultPrevented).toBe(true);
+    expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'same');
+  });
+
+  it('mobile: /k/m/ 形式 + props 空で deny → 自レコード', async () => {
+    const s = await shown({
+      listOpts: { custHref: (r) => '/k/m/2/show?record=' + r.cust, detailLink: false },
+      deps: { platform: 'mobile' },
+    });
+    expect(prefetched(s)).toMatchObject({ keyType: 'id', value: '5' });
+    s.acl.states.set(KEY0, 'deny');
+    click(s.a);
+    expect(s.navigate).toHaveBeenCalledWith('/k/m/1/show?record=10', 'same');
   });
 });
 
