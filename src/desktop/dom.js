@@ -5,13 +5,32 @@
 import { isTargetView, resolveLookupMode, loadConfig } from '../core/config.js';
 import { parseRecordUrl, buildRecordUrl, getGuestSpaceIdFromPath, getGuestSpaceIdFromApiUrl } from '../core/url.js';
 import { createAclChecker, createKintoneFetcher, createKintoneRecordFetcher } from '../core/acl.js';
-import { decideRowClick, resolveOpenMode, INTERACTIVE_SELECTOR } from '../core/rowClick.js';
+import { decideRowClick, decideLinkClick, resolveOpenMode, INTERACTIVE_SELECTOR } from '../core/rowClick.js';
 
 const MSG_PENDING = '遷移先の権限を確認しています…';
 const MSG_DENY = '遷移先レコードの閲覧権限がありません';
 const MSG_ERROR = '権限を確認できませんでした';
 const MSG_NOTFOUND = 'リンク先のレコードが見つかりません';
 
+const MSG_TOAST = {
+  lookup: {
+    deny: 'ルックアップ先レコードの閲覧権限がないため開けません',
+    notfound: 'ルックアップ先のレコードが見つかりません',
+    error: '閲覧権限を確認できなかったため開けません',
+  },
+  recordLink: {
+    deny: 'リンク先レコードの閲覧権限がないため開けません',
+    notfound: 'リンク先のレコードが見つかりません',
+    error: '閲覧権限を確認できなかったため開けません',
+  },
+};
+const MSG_TAB_FAIL = '新しいタブを開けませんでした。もう一度クリックしてください';
+const MSG_POPUP = 'ポップアップがブロックされました。もう一度クリックしてください';
+
+const CLS_CHECKING = 'klc-acl-checking';
+const CLS_BUSY = 'klc-busy';
+const CLICK_TIMEOUT_MS = 1500;
+const TOAST_MS = 3000;
 const CLS_PENDING = 'klc-acl-pending';
 const CLS_DENIED = 'klc-acl-denied';
 const CLS_TEXT = 'klc-lookup-text';
@@ -78,6 +97,77 @@ export function applyDisabled(a, reason) {
   a.setAttribute(ATTR_STATE, reason === 'text' ? 'text' : reason);
 }
 
+let toastTimer = null;
+
+/**
+ * 画面下部に短いメッセージを出す（textContent のみ。要素は使い回す）。
+ * @param {Document} doc
+ * @param {string} text
+ * @param {number} [ms]
+ */
+export function showToast(doc, text, ms = TOAST_MS) {
+  let el = doc.querySelector('div.klc-toast');
+  if (!el) {
+    el = doc.createElement('div');
+    el.className = 'klc-toast';
+    el.setAttribute('role', 'status');
+    el.setAttribute('aria-live', 'polite');
+    doc.body.appendChild(el);
+  }
+  el.textContent = String(text);
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    el.hidden = true;
+  }, ms);
+}
+
+/**
+ * クリックハンドラ内で同期的に空タブを開くためのハンドル。
+ * @param {Window} win
+ * @returns {{blocked: boolean, go: (url: string) => boolean|void, close: () => void}}
+ *   go は遷移に失敗したら（空タブを閉じて）false を返す
+ */
+export function openBlankTab(win) {
+  let w = null;
+  try {
+    w = win.open('', '_blank');
+  } catch {
+    w = null;
+  }
+  if (!w) return { blocked: true, go() {}, close() {} };
+  try {
+    w.opener = null;
+  } catch {
+    /* 無視 */
+  }
+  return {
+    blocked: false,
+    go(url) {
+      if (w.closed) return true;
+      try {
+        w.location.replace(new URL(url, win.location.href).href);
+        return true;
+      } catch {
+        // 一覧のタブは遷移させない。空タブを閉じ、呼び出し側が再クリックを促す
+        try {
+          w.close();
+        } catch {
+          /* 無視 */
+        }
+        return false;
+      }
+    },
+    close() {
+      try {
+        if (!w.closed) w.close();
+      } catch {
+        /* 無視 */
+      }
+    },
+  };
+}
+
 /** href（退避中なら退避先）を取得 */
 function currentHref(a) {
   return a.getAttribute('href') ?? a.getAttribute(ATTR_HREF);
@@ -104,6 +194,9 @@ export function findOwnRecordUrl(tr, appId, recordId, host) {
  *  aclChecker: ReturnType<typeof import('../core/acl.js').createAclChecker>|null,
  *  host: string, currentSpaceId: string|null,
  *  navigate: (url: string, mode: 'same'|'new') => void,
+ *  openTab?: () => {blocked: boolean, go: (url: string) => void, close: () => void},
+ *  toast?: (msg: string) => void,
+ *  clickTimeoutMs?: number,
  *  root: Window|Document, getSelection: () => Selection|null
  * }} deps
  */
@@ -114,8 +207,11 @@ export function createListController(deps) {
   let targetView = false;
   /** @type {WeakMap<Element, {recordId: string, dataCells: Set<Element>}>} */
   const rowInfo = new WeakMap();
-  /** @type {WeakMap<Element, {kind: 'lookup'|'recordLink', fieldCode: string, rowRecordId: string, mode: string}>} */
+  /** @type {WeakMap<Element, {kind: 'lookup'|'recordLink', fieldCode: string, rowRecordId: string, mode: string, checked: boolean, req: any}>} */
   const anchorInfo = new WeakMap();
+  /** クリック時の判定中のアンカー */
+  const checking = new WeakSet();
+  let busyCount = 0;
 
   function ensureBound() {
     if (bound) return;
@@ -187,10 +283,15 @@ export function createListController(deps) {
         const parsed = href ? parseRecordUrl(href, host) : null;
         if (isLookup) {
           const mode = resolveLookupMode(config, code);
-          anchorInfo.set(anchor, { kind: 'lookup', fieldCode: code, rowRecordId: String(rowRecordId), mode });
+          const info = { kind: 'lookup', fieldCode: code, rowRecordId: String(rowRecordId), mode, checked: false, req: null };
+          anchorInfo.set(anchor, info);
           if (mode === 'text') return disable(anchor, 'text');
           if (mode === 'self') return;
           if (!(permOn && config.permission.targets.lookup)) return;
+          if (!href) {
+            info.checked = true; // リンク先なし: API は呼ばずクリック時に notfound 扱い
+            return;
+          }
           const lk = prop.lookup;
           const appId = lk?.relatedApp?.app ?? parsed?.appId;
           if (!appId) return;
@@ -206,16 +307,22 @@ export function createListController(deps) {
           } else {
             return;
           }
+          info.checked = true;
+          info.req = req;
           entries.push({ anchor, req, kind: 'lookup' });
         } else {
-          anchorInfo.set(anchor, { kind: 'recordLink', fieldCode: code, rowRecordId: String(rowRecordId), mode: 'standard' });
+          const info = { kind: 'recordLink', fieldCode: code, rowRecordId: String(rowRecordId), mode: 'standard', checked: false, req: null };
+          anchorInfo.set(anchor, info);
           if (!(permOn && config.permission.targets.recordLink)) return;
+          if (!href) {
+            info.checked = true;
+            return;
+          }
           if (!parsed || !parsed.recordId) return;
-          entries.push({
-            anchor,
-            req: { spaceId: parsed.spaceId, appId: parsed.appId, keyType: 'id', keyField: null, value: parsed.recordId },
-            kind: 'recordLink',
-          });
+          const req = { spaceId: parsed.spaceId, appId: parsed.appId, keyType: 'id', keyField: null, value: parsed.recordId };
+          info.checked = true;
+          info.req = req;
+          entries.push({ anchor, req, kind: 'recordLink' });
         }
       });
     }
@@ -229,55 +336,16 @@ export function createListController(deps) {
     if (rowMode) anchor.classList.add(CLS_ROWLINK);
   }
 
-  function applyState(anchor, state, onStandardError) {
-    if (state === 'allow') return applyAllow(anchor);
-    if (state === 'deny') return disable(anchor, 'deny');
-    if (state === 'notfound') return disable(anchor, 'notfound');
-    // error
-    if (config.permission.onError === 'disable') return disable(anchor, 'error');
-    if (onStandardError) onStandardError();
-    applyAllow(anchor);
-  }
-
-  function runAcl(gen, entries) {
+  /** 表示時: 判定を裏で実行してキャッシュを温めるだけ（DOM には触れない） */
+  function prefetch(entries) {
     if (!aclChecker || entries.length === 0) return;
-    let warned = false;
-    const warnOnce = () => {
-      if (warned) return;
-      warned = true;
-      warn('権限を確認できなかったため標準動作にします');
-    };
-    const unresolved = [];
-    for (const e of entries) {
-      const s = aclChecker.peek(e.req);
-      if (s === 'allow' || s === 'deny' || s === 'notfound') applyState(e.anchor, s);
-      else {
-        applyPending(e.anchor);
-        unresolved.push(e);
-      }
-    }
-    if (unresolved.length === 0) return;
-    let p;
+    const reqs = entries.filter((e) => aclChecker.peek(e.req) === null).map((e) => e.req);
+    if (reqs.length === 0) return;
     try {
-      p = Promise.resolve(aclChecker.check(unresolved.map((e) => e.req)));
-    } catch (err) {
-      p = Promise.reject(err);
+      Promise.resolve(aclChecker.check(reqs)).catch(() => {});
+    } catch {
+      /* 無視 */
     }
-    p.then(
-      (map) => {
-        if (gen !== generation) return;
-        for (const e of unresolved) {
-          if (!e.anchor.isConnected) continue;
-          applyState(e.anchor, map.get(aclChecker.cacheKey(e.req)) || 'error', warnOnce);
-        }
-      },
-      () => {
-        if (gen !== generation) return;
-        for (const e of unresolved) {
-          if (e.anchor.isConnected) applyState(e.anchor, 'error', warnOnce);
-        }
-      },
-    );
   }
 
   /** @param {{records?: any[], viewType?: string, viewId?: number|string}} event */
@@ -296,19 +364,124 @@ export function createListController(deps) {
       .then((props) => {
         if (gen !== generation) return;
         const entries = buildEntries(records, cellsByCode, props || {});
-        runAcl(gen, entries);
+        prefetch(entries);
       })
       .catch((e) => warn(e));
   }
 
-  function openModeOf(e) {
+  function openModeOf(e, a) {
+    const t = a && typeof a.getAttribute === 'function' ? a.getAttribute('target') : null;
     return resolveOpenMode({
+      targetBlank: typeof t === 'string' && t.trim().toLowerCase() === '_blank',
       openMode: config.openMode,
       ctrlKey: e.ctrlKey,
       metaKey: e.metaKey,
       shiftKey: e.shiftKey,
       button: e.button,
     });
+  }
+
+  function ownRecordUrl(a, info) {
+    const appId = deps.getAppId();
+    return (
+      findOwnRecordUrl(a.closest('tr'), appId, info.rowRecordId, host) ||
+      buildRecordUrl({ appId, recordId: info.rowRecordId, spaceId: currentSpaceId, platform })
+    );
+  }
+
+  function isHttpHref(href) {
+    try {
+      const u = new URL(href, 'https://' + host);
+      return u.protocol === 'https:' || u.protocol === 'http:';
+    } catch {
+      return false;
+    }
+  }
+
+  function setBusy(a, on) {
+    const html = a.ownerDocument.documentElement;
+    if (on) {
+      a.classList.add(CLS_CHECKING);
+      a.setAttribute('aria-busy', 'true');
+      busyCount++;
+      html.classList.add(CLS_BUSY);
+    } else {
+      a.classList.remove(CLS_CHECKING);
+      a.removeAttribute('aria-busy');
+      busyCount = Math.max(0, busyCount - 1);
+      if (busyCount === 0) html.classList.remove(CLS_BUSY);
+    }
+  }
+
+  function finishLinkClick(ctx, state) {
+    const d = decideLinkClick({ state, onDeny: config.permission.onDeny, onError: config.permission.onError });
+    if (d.reason === 'error' || d.reason === 'timeout') warn('遷移先の権限を確認できませんでした', d.action);
+    const toast = deps.toast || ((m) => showToast(document, m));
+    if (d.action === 'block') {
+      if (ctx.tab && !ctx.tab.blocked) ctx.tab.close();
+      const msgs = MSG_TOAST[ctx.info && ctx.info.kind === 'recordLink' ? 'recordLink' : 'lookup'];
+      toast(msgs[d.reason === 'timeout' ? 'error' : d.reason]);
+      return;
+    }
+    const url = d.action === 'target' ? ctx.href : ownRecordUrl(ctx.a, ctx.info);
+    if (ctx.tab) {
+      if (ctx.tab.blocked) {
+        deps.navigate(url, 'new');
+        toast(MSG_POPUP);
+      } else {
+        if (ctx.tab.go(url) === false) toast(MSG_TAB_FAIL);
+      }
+      return;
+    }
+    deps.navigate(url, ctx.mode);
+  }
+
+  function handleCheckedLink(e, a, info) {
+    const href = currentHref(a);
+    let state = null;
+    if (!href) state = 'notfound';
+    else if (!isHttpHref(href)) return; // javascript: など → 介入しない
+    const mode = openModeOf(e, a);
+    if (!state) {
+      if (!info.req) return; // 表示時に href がなかったが今はある → 介入しない
+      const s = aclChecker ? aclChecker.peek(info.req) : null;
+      if (s === 'allow' || s === 'deny' || s === 'notfound') state = s;
+    }
+    if (state === 'allow' && mode === 'same') return; // 標準のリンク動作
+    e.preventDefault();
+    e.stopPropagation();
+    if (checking.has(a)) return;
+    const ctx = { a, info, href, mode, tab: null };
+    if (state) {
+      finishLinkClick(ctx, state);
+      return;
+    }
+    if (mode === 'new') ctx.tab = (deps.openTab || (() => openBlankTab(window)))();
+    checking.add(a);
+    setBusy(a, true);
+    let timer;
+    const timeoutMs = deps.clickTimeoutMs ?? CLICK_TIMEOUT_MS;
+    const verdict = Promise.resolve()
+      .then(() => aclChecker.check([info.req]))
+      .then(
+        (m) => (m && m.get(aclChecker.cacheKey(info.req))) || 'error',
+        () => 'error',
+      );
+    Promise.race([
+      verdict,
+      new Promise((r) => {
+        timer = setTimeout(() => r('timeout'), timeoutMs);
+      }),
+    ])
+      .then((st) => {
+        clearTimeout(timer);
+        finishLinkClick(ctx, st);
+      })
+      .catch((err) => warn(err))
+      .finally(() => {
+        checking.delete(a);
+        setBusy(a, false);
+      });
   }
 
   function handleEvent(e) {
@@ -338,11 +511,10 @@ export function createListController(deps) {
       } else if (info.mode === 'self' && info.kind === 'lookup') {
         e.preventDefault();
         e.stopPropagation();
-        const appId = deps.getAppId();
-        const url =
-          findOwnRecordUrl(a.closest('tr'), appId, info.rowRecordId, host) ||
-          buildRecordUrl({ appId, recordId: info.rowRecordId, spaceId: currentSpaceId, platform });
-        deps.navigate(url, openModeOf(e));
+        deps.navigate(ownRecordUrl(a, info), openModeOf(e, a));
+        return;
+      } else if (info.checked) {
+        handleCheckedLink(e, a, info);
         return;
       } else {
         return; // standard: 素通し
@@ -448,6 +620,8 @@ export function setupEntry({ platform, eventName, kintone, getAppId, getFieldEle
       if (mode === 'new') window.open(url, '_blank', 'noopener');
       else location.href = url;
     },
+    openTab: () => openBlankTab(window),
+    toast: (m) => showToast(document, m),
     root: window,
     getSelection: () => window.getSelection(),
   });
