@@ -1,0 +1,27 @@
+{
+  "manifest_version": 1,
+  "version": 1,
+  "type": "APP",
+  "name": {
+    "ja": "一覧画面クリック遷移制御",
+    "en": "List Click Navigation Control"
+  },
+  "description": {
+    "ja": "一覧画面で行全体のクリックによるレコード詳細への遷移、ルックアップリンクの挙動、遷移先の閲覧権限に応じたリンクの有効/無効を制御します。",
+    "en": "Controls row click navigation, lookup link behavior and permission-aware link enabling on the record list."
+  },
+  "icon": "image/icon.png",
+  "desktop": {
+    "js": ["js/desktop.js"],
+    "css": ["css/plugin.css"]
+  },
+  "mobile": {
+    "js": ["js/mobile.js"],
+    "css": ["css/plugin.css"]
+  },
+  "config": {
+    "html": "html/config.html",
+    "js": ["js/config.js"],
+    "css": ["css/plugin.css"]
+  }
+}

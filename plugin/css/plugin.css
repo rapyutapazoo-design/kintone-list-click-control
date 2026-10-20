@@ -1,0 +1,62 @@
+/* 一覧画面（desktop / mobile）*/
+.klc-row-clickable {
+  cursor: pointer;
+}
+.klc-row-clickable:hover > td {
+  background-color: #f0f6ff;
+}
+.klc-acl-pending {
+  opacity: 0.6;
+  cursor: progress;
+}
+.klc-acl-denied {
+  color: #888 !important;
+  text-decoration: none !important;
+  cursor: not-allowed;
+}
+.klc-lookup-text {
+  color: inherit !important;
+  text-decoration: none !important;
+  cursor: text;
+}
+
+/* 設定画面 */
+.klc-config {
+  max-width: 760px;
+  padding: 16px 24px 48px;
+  font-size: 14px;
+  color: #333;
+}
+.klc-config .klc-section {
+  margin: 0 0 28px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #e3e7e8;
+}
+.klc-config .klc-section > h3 {
+  margin: 0 0 12px;
+  font-size: 16px;
+  font-weight: bold;
+}
+.klc-config .klc-note {
+  margin: 4px 0 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #666;
+}
+.klc-config .klc-field-row {
+  margin: 0 0 12px;
+}
+.klc-config .klc-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 24px;
+}
+.klc-config .klc-lookup-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.klc-config .klc-lookup-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid #eef0f1;
+  vertical-align: middle;
+}
