@@ -128,18 +128,36 @@ describe('resolveKeyPath', () => {
 
 describe('assertKeyPathSafe', () => {
   const repoRoot = '/repo';
+  it('uses checkIgnore result: true passes, false throws even if text has *.ppk', () => {
+    const base = { keyPath: '/repo/k.ppk', repoRoot, gitignoreText: '*.ppk\n!k.ppk\n' };
+    expect(() => assertKeyPathSafe({ ...base, checkIgnore: () => true })).not.toThrow();
+    expect(() => assertKeyPathSafe({ ...base, checkIgnore: () => false })).toThrow(/git check-ignore/);
+  });
+  it('falls back to text check when checkIgnore is indeterminate; negation stops', () => {
+    const ci = () => null;
+    expect(() => assertKeyPathSafe({ keyPath: '/repo/k.ppk', repoRoot, gitignoreText: '*.ppk', checkIgnore: ci })).not.toThrow();
+    expect(() => assertKeyPathSafe({ keyPath: '/repo/k.ppk', repoRoot, gitignoreText: '*.ppk\n!k.ppk', checkIgnore: ci })).toThrow(/否定/);
+    expect(() => assertKeyPathSafe({ keyPath: '/repo/k.ppk', repoRoot, gitignoreText: '', checkIgnore: ci })).toThrow(/\*\.ppk/);
+  });
+  it('outside-repo check: only ".." or "../" prefix; "..keys" dir is inside', () => {
+    const ci = () => false;
+    expect(() => assertKeyPathSafe({ keyPath: '/repo/..keys/k.ppk', repoRoot, checkIgnore: ci })).toThrow();
+    expect(() => assertKeyPathSafe({ keyPath: '/other/k.ppk', repoRoot, checkIgnore: ci })).not.toThrow();
+    expect(() => assertKeyPathSafe({ keyPath: '/k.ppk', repoRoot: '/repo/sub', checkIgnore: ci })).not.toThrow();
+    expect(() => assertKeyPathSafe({ keyPath: '/repo', repoRoot, checkIgnore: ci })).not.toThrow();
+  });
   it('allows paths outside the repo', () => {
-    expect(() => assertKeyPathSafe({ keyPath: '/tmp/other/k.ppk', repoRoot, gitignoreText: '' })).not.toThrow();
+    expect(() => assertKeyPathSafe({ keyPath: '/tmp/other/k.ppk', repoRoot, gitignoreText: '', checkIgnore: () => null })).not.toThrow();
   });
   it('allows .ppk inside the repo when *.ppk is ignored', () => {
-    expect(() => assertKeyPathSafe({ keyPath: '/repo/private.ppk', repoRoot, gitignoreText: 'dist/\n*.ppk\n' })).not.toThrow();
+    expect(() => assertKeyPathSafe({ keyPath: '/repo/private.ppk', repoRoot, gitignoreText: 'dist/\n*.ppk\n', checkIgnore: () => null })).not.toThrow();
   });
   it('throws for non-.ppk inside the repo', () => {
-    expect(() => assertKeyPathSafe({ keyPath: '/repo/k.pem', repoRoot, gitignoreText: '*.ppk' })).toThrow(/\.ppk/);
+    expect(() => assertKeyPathSafe({ keyPath: '/repo/k.pem', repoRoot, gitignoreText: '*.ppk', checkIgnore: () => null })).toThrow(/\.ppk/);
   });
   it('throws when *.ppk is not in .gitignore (including comment-only)', () => {
-    expect(() => assertKeyPathSafe({ keyPath: '/repo/k.ppk', repoRoot, gitignoreText: 'dist/' })).toThrow(/\*\.ppk/);
-    expect(() => assertKeyPathSafe({ keyPath: '/repo/k.ppk', repoRoot, gitignoreText: '# *.ppk\n' })).toThrow(/\*\.ppk/);
+    expect(() => assertKeyPathSafe({ keyPath: '/repo/k.ppk', repoRoot, gitignoreText: 'dist/', checkIgnore: () => null })).toThrow(/\*\.ppk/);
+    expect(() => assertKeyPathSafe({ keyPath: '/repo/k.ppk', repoRoot, gitignoreText: '# *.ppk\n', checkIgnore: () => null })).toThrow(/\*\.ppk/);
   });
 });
 

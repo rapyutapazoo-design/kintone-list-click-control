@@ -256,6 +256,8 @@ describe('rowClick', () => {
     expect(resolveOpenMode({ openMode: 'same', metaKey: true })).toBe('new');
     expect(resolveOpenMode({ openMode: 'same', shiftKey: true })).toBe('new');
     expect(resolveOpenMode({ openMode: 'same', button: 1 })).toBe('new');
+    expect(resolveOpenMode({ openMode: 'same', targetBlank: true })).toBe('new');
+    expect(resolveOpenMode({ openMode: 'same', targetBlank: false })).toBe('same');
   });
   it('INTERACTIVE_SELECTOR', () => {
     expect(INTERACTIVE_SELECTOR).toContain('button');

@@ -681,6 +681,99 @@ describe('リンククリック時の権限判定', () => {
       expect(s.navigate).toHaveBeenCalledWith('/k/2/show#record=5', 'new');
       expect(s.toast).toHaveBeenCalledWith('ポップアップがブロックされました。もう一度クリックしてください');
     });
+    it('tab.go が false（遷移失敗）なら一覧タブは遷移させず、再クリックを促すトースト', async () => {
+      const failing = { blocked: false, go: vi.fn(() => false), close: vi.fn() };
+      const s = await shown(permCfg(), { deps: { openTab: vi.fn(() => failing) } });
+      click(s.a, { ctrlKey: true });
+      await flush();
+      s.acl.resolveAll(() => 'allow');
+      await flush();
+      expect(failing.go).toHaveBeenCalledTimes(1);
+      expect(s.navigate).not.toHaveBeenCalled();
+      expect(s.toast).toHaveBeenCalledWith('新しいタブを開けませんでした。もう一度クリックしてください');
+    });
+  });
+
+  describe('target=_blank のアンカー', () => {
+    const blankShown = async (cfg = permCfg()) => {
+      const s = await shown(cfg);
+      s.a.setAttribute('target', '_BLANK');
+      return s;
+    };
+    it('キャッシュあり allow: 素通しせず new で開く', async () => {
+      const s = await blankShown();
+      s.acl.states.set(KEY0, 'allow');
+      const ev = click(s.a);
+      expect(ev.defaultPrevented).toBe(true);
+      expect(s.navigate).toHaveBeenCalledWith('/k/2/show#record=5', 'new');
+    });
+    it('キャッシュあり deny: 自レコードを new で開く', async () => {
+      const s = await blankShown();
+      s.acl.states.set(KEY0, 'deny');
+      click(s.a);
+      expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'new');
+    });
+    it('キャッシュなし: openTab → tab.go、navigate しない', async () => {
+      const s = await blankShown();
+      click(s.a);
+      expect(s.deps.openTab).toHaveBeenCalledTimes(1);
+      await flush();
+      s.acl.resolveAll(() => 'allow');
+      await flush();
+      expect(s.tab.go).toHaveBeenCalledWith('/k/2/show#record=5');
+      expect(s.navigate).not.toHaveBeenCalled();
+    });
+    it('キャッシュなし onError: 自レコードを tab.go（check 失敗）', async () => {
+      const s = await blankShown();
+      click(s.a);
+      await flush();
+      s.acl.rejectNext();
+      await flush();
+      s.acl.rejectNext();
+      await flush();
+      expect(s.tab.go).toHaveBeenCalledWith('/k/1/show#record=10');
+      expect(s.navigate).not.toHaveBeenCalled();
+    });
+    it('タイムアウト: 自レコードを tab.go', async () => {
+      const s = await blankShown();
+      s.acl.check.mockImplementation(() => new Promise(() => {}));
+      click(s.a);
+      expect(s.deps.openTab).toHaveBeenCalledTimes(1);
+      await new Promise((r) => setTimeout(r, 1600));
+      expect(s.tab.go).toHaveBeenCalledWith('/k/1/show#record=10');
+    }, 5000);
+    it('lookup self モード: new で自レコードへ', async () => {
+      const acl = fakeAcl();
+      const s = mk({ deps: { aclChecker: acl } }, { lookup: { mode: 'self', fields: {} } });
+      s.controller.onIndexShow({ viewType: 'list', viewId: 1, records: s.list.records });
+      await flush();
+      const a = s.list.cells.cust[0].querySelector('a');
+      a.setAttribute('target', '_blank');
+      click(a);
+      expect(s.navigate).toHaveBeenCalledWith('/k/1/show#record=10', 'new');
+    });
+  });
+
+  it('recordLink の block トーストは「リンク先」文言', async () => {
+    const s = await shown({ permission: { enabled: true, targets: { lookup: true, recordLink: true }, onDeny: 'disable' } });
+    s.acl.states.set('3|id|5', 'deny');
+    click(s.list.cells.link[0].querySelector('a'));
+    expect(s.toast).toHaveBeenLastCalledWith('リンク先レコードの閲覧権限がないため開けません');
+    s.acl.states.set('3|id|5', 'notfound');
+    click(s.list.cells.link[0].querySelector('a'));
+    expect(s.toast).toHaveBeenLastCalledWith('リンク先のレコードが見つかりません');
+  });
+
+  it('表示時に href がなく、クリック時に付いた場合は介入せず素通し（例外にならない）', async () => {
+    const list = buildList([{ id: 10, cust: 5 }], { custHref: () => null });
+    const s = await shown(permCfg(), { list });
+    s.a.setAttribute('href', '/k/2/show#record=5');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ev = click(s.a);
+    expect(ev.defaultPrevented).toBe(false);
+    expect(s.navigate).not.toHaveBeenCalled();
+    expect(s.acl.peek).not.toHaveBeenCalledWith(null);
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it('href なし: プリフェッチに含まれず、check せず同期的に自レコードへ（disable なら notfound のトースト）', async () => {
@@ -786,6 +879,19 @@ describe('openBlankTab', () => {
     w.closed = false;
     t.close();
     expect(w.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('go の location.replace が失敗したら空タブを close し、false を返す（一覧のタブは遷移させない）', () => {
+    const w = mkTab();
+    w.location.replace = vi.fn(() => {
+      throw new Error('x');
+    });
+    const win = { ...mkWin(w), location: { href: 'https://x.cybozu.com/k/1/', assign: vi.fn() } };
+    const t = openBlankTab(win);
+    expect(t.go('/k/2/show#record=5')).toBe(false);
+    expect(w.close).toHaveBeenCalledTimes(1);
+    expect(win.location.assign).not.toHaveBeenCalled();
+    expect(win.open).toHaveBeenCalledTimes(1);
   });
 
   it('open が null を返すか throw したら blocked', () => {

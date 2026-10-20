@@ -13,10 +13,18 @@ const MSG_ERROR = '権限を確認できませんでした';
 const MSG_NOTFOUND = 'リンク先のレコードが見つかりません';
 
 const MSG_TOAST = {
-  deny: 'ルックアップ先レコードの閲覧権限がないため開けません',
-  notfound: 'ルックアップ先のレコードが見つかりません',
-  error: '閲覧権限を確認できなかったため開けません',
+  lookup: {
+    deny: 'ルックアップ先レコードの閲覧権限がないため開けません',
+    notfound: 'ルックアップ先のレコードが見つかりません',
+    error: '閲覧権限を確認できなかったため開けません',
+  },
+  recordLink: {
+    deny: 'リンク先レコードの閲覧権限がないため開けません',
+    notfound: 'リンク先のレコードが見つかりません',
+    error: '閲覧権限を確認できなかったため開けません',
+  },
 };
+const MSG_TAB_FAIL = '新しいタブを開けませんでした。もう一度クリックしてください';
 const MSG_POPUP = 'ポップアップがブロックされました。もう一度クリックしてください';
 
 const CLS_CHECKING = 'klc-acl-checking';
@@ -117,7 +125,8 @@ export function showToast(doc, text, ms = TOAST_MS) {
 /**
  * クリックハンドラ内で同期的に空タブを開くためのハンドル。
  * @param {Window} win
- * @returns {{blocked: boolean, go: (url: string) => void, close: () => void}}
+ * @returns {{blocked: boolean, go: (url: string) => boolean|void, close: () => void}}
+ *   go は遷移に失敗したら（空タブを閉じて）false を返す
  */
 export function openBlankTab(win) {
   let w = null;
@@ -135,11 +144,18 @@ export function openBlankTab(win) {
   return {
     blocked: false,
     go(url) {
-      if (w.closed) return;
+      if (w.closed) return true;
       try {
         w.location.replace(new URL(url, win.location.href).href);
+        return true;
       } catch {
-        win.open(url, '_blank', 'noopener');
+        // 一覧のタブは遷移させない。空タブを閉じ、呼び出し側が再クリックを促す
+        try {
+          w.close();
+        } catch {
+          /* 無視 */
+        }
+        return false;
       }
     },
     close() {
@@ -353,8 +369,10 @@ export function createListController(deps) {
       .catch((e) => warn(e));
   }
 
-  function openModeOf(e) {
+  function openModeOf(e, a) {
+    const t = a && typeof a.getAttribute === 'function' ? a.getAttribute('target') : null;
     return resolveOpenMode({
+      targetBlank: typeof t === 'string' && t.trim().toLowerCase() === '_blank',
       openMode: config.openMode,
       ctrlKey: e.ctrlKey,
       metaKey: e.metaKey,
@@ -401,7 +419,8 @@ export function createListController(deps) {
     const toast = deps.toast || ((m) => showToast(document, m));
     if (d.action === 'block') {
       if (ctx.tab && !ctx.tab.blocked) ctx.tab.close();
-      toast(MSG_TOAST[d.reason === 'timeout' ? 'error' : d.reason]);
+      const msgs = MSG_TOAST[ctx.info && ctx.info.kind === 'recordLink' ? 'recordLink' : 'lookup'];
+      toast(msgs[d.reason === 'timeout' ? 'error' : d.reason]);
       return;
     }
     const url = d.action === 'target' ? ctx.href : ownRecordUrl(ctx.a, ctx.info);
@@ -410,7 +429,7 @@ export function createListController(deps) {
         deps.navigate(url, 'new');
         toast(MSG_POPUP);
       } else {
-        ctx.tab.go(url);
+        if (ctx.tab.go(url) === false) toast(MSG_TAB_FAIL);
       }
       return;
     }
@@ -422,8 +441,9 @@ export function createListController(deps) {
     let state = null;
     if (!href) state = 'notfound';
     else if (!isHttpHref(href)) return; // javascript: など → 介入しない
-    const mode = openModeOf(e);
+    const mode = openModeOf(e, a);
     if (!state) {
+      if (!info.req) return; // 表示時に href がなかったが今はある → 介入しない
       const s = aclChecker ? aclChecker.peek(info.req) : null;
       if (s === 'allow' || s === 'deny' || s === 'notfound') state = s;
     }
@@ -491,7 +511,7 @@ export function createListController(deps) {
       } else if (info.mode === 'self' && info.kind === 'lookup') {
         e.preventDefault();
         e.stopPropagation();
-        deps.navigate(ownRecordUrl(a, info), openModeOf(e));
+        deps.navigate(ownRecordUrl(a, info), openModeOf(e, a));
         return;
       } else if (info.checked) {
         handleCheckedLink(e, a, info);

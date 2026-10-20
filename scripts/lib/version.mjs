@@ -1,5 +1,6 @@
-// 版番号に関する純粋関数（fs / process に依存しない）。
-import { resolve, join, relative, isAbsolute, extname } from 'node:path';
+// 版番号に関する関数群（fs / process に依存しない）。gitCheckIgnore のみ git を子プロセスで呼ぶ（実行関数は注入可能）。
+import { resolve, join, relative, isAbsolute, extname, sep } from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 const VERSION_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
@@ -79,19 +80,46 @@ export function resolveKeyPath({ env = {}, dotenv = {}, cwd, homedir }) {
 }
 
 /**
- * 鍵がリポジトリ内にある場合、.ppk かつ .gitignore で除外済みであることを確認する。違反は throw。
- * @param {{keyPath: string, repoRoot: string, gitignoreText?: string}} p
+ * `git check-ignore -q` で除外済みか判定する。
+ * @returns {boolean | null} true=除外済み / false=除外されていない / null=判定不能（git 不在・非リポジトリ等）
  */
-export function assertKeyPathSafe({ keyPath, repoRoot, gitignoreText = '' }) {
+export function gitCheckIgnore(keyPath, repoRoot) {
+  try {
+    const r = spawnSync('git', ['check-ignore', '-q', '--', keyPath], { cwd: repoRoot, stdio: 'ignore' });
+    if (r.error) return null;
+    if (r.status === 0) return true;
+    if (r.status === 1) return false;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 鍵がリポジトリ内にある場合、.ppk かつ .gitignore で除外済みであることを確認する。違反は throw。
+ * 判定は checkIgnore（既定: git check-ignore）。判定不能（null）のときは .gitignore の文字列検査に
+ * フォールバックし、否定行（!...ppk）があれば安全側で停止する。
+ * @param {{keyPath: string, repoRoot: string, gitignoreText?: string, checkIgnore?: (keyPath: string, repoRoot: string) => boolean | null}} p
+ */
+export function assertKeyPathSafe({ keyPath, repoRoot, gitignoreText = '', checkIgnore = gitCheckIgnore }) {
   const rel = relative(repoRoot, keyPath);
-  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return;
+  if (rel === '' || rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel)) return;
   if (extname(keyPath).toLowerCase() !== '.ppk') {
     throw new Error(`鍵ファイル ${keyPath} はリポジトリ内にありますが、拡張子が .ppk ではありません。コミット事故を防ぐため .ppk にするか、リポジトリ外に置いてください。`);
   }
+  const ignored = checkIgnore(keyPath, repoRoot);
+  if (ignored === true) return;
+  if (ignored === false) {
+    throw new Error(`鍵ファイル ${keyPath} はリポジトリ内にありますが、git で除外されていません（git check-ignore）。.gitignore に *.ppk を追加するか、リポジトリ外に置いてください。`);
+  }
+  // 判定不能: 文字列検査へフォールバック（安全側）
   const lines = gitignoreText
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter((l) => l !== '' && !l.startsWith('#'));
+  if (lines.some((l) => l.startsWith('!') && l.toLowerCase().includes('.ppk'))) {
+    throw new Error(`鍵ファイル ${keyPath} はリポジトリ内にありますが、.gitignore に .ppk の否定行（!）があり、除外を確認できません。否定行を外すか、リポジトリ外に置いてください。`);
+  }
   if (!lines.includes('*.ppk')) {
     throw new Error(`鍵ファイル ${keyPath} はリポジトリ内にありますが、.gitignore に *.ppk がありません。追加するか、リポジトリ外に置いてください。`);
   }

@@ -54,7 +54,13 @@ if (check.reason === 'forced') {
 }
 
 // 鍵のパス: 環境変数 > .env > ./private.ppk
-const dotenv = existsSync('.env') ? parseEnv(readFileSync('.env', 'utf-8')) : {};
+let dotenv = {};
+try {
+  if (existsSync('.env')) dotenv = parseEnv(readFileSync('.env', 'utf-8'));
+} catch (e) {
+  console.error(`.env を読み込めませんでした（権限や形式を確認してください）: ${e.message ?? e}`);
+  process.exit(1);
+}
 const keyPath = resolveKeyPath({ env: process.env, dotenv, cwd: process.cwd(), homedir: homedir() });
 try {
   assertKeyPathSafe({
